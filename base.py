@@ -1,44 +1,55 @@
 import RPi.GPIO as G
 import keyboard as k
 import time
- 
+
+# 左モータ
+L_IN1, L_IN2, L_PWM = 23, 24, 13
+# 右モータ
+R_IN1, R_IN2, R_PWM = 5, 6, 12
+
 G.setmode(G.BCM)
-G.setup([23, 24], G.OUT)
+G.setup([L_IN1, L_IN2, L_PWM, R_IN1, R_IN2, R_PWM], G.OUT)  # PWMピンもsetup
+
+pl = G.PWM(L_PWM, 1000)
+pr = G.PWM(R_PWM, 1000)
 v = 75
-p = G.PWM(18, 1000)
-p.start(v)
- 
-while True:
-    time.sleep(0.1)
-    if k.is_pressed("q"):
-        v += 10
-        if v > 100:
-            v = 100
-        if v < 0:
-            v = 0
-        p.ChangeDutyCycle(v)
-    if k.is_pressed("e"):
-        v -= 10
-        if v > 100:
-            v = 100
-        if v < 0:
-            v = 0
-        p.ChangeDutyCycle(v)
-    
-    if k.is_pressed("w"):
-        G.output(23, G.HIGH)
-        G.output(24, G.LOW)
-    if k.is_pressed("s"):
-        G.output(23, G.HIGH)
-        G.output(24, G.LOW)
-    if k.is_pressed("d"):
-        G.output(23, G.LOW)
-        G.output(24, G.HIGH)
-    if k.is_pressed("a"):
-        G.output(23, G.LOW)
-        G.output(24, G.HIGH)
-    if k.is_pressed("f"):
-        break
- 
-p.stop()
-G.cleanup()
+pl.start(v)
+pr.start(v)
+
+def motor(in1, in2, d):
+    """d: 1=正転, -1=逆転, 0=停止"""
+    G.output(in1, G.HIGH if d == 1 else G.LOW)
+    G.output(in2, G.HIGH if d == -1 else G.LOW)
+
+def drive(left, right):
+    motor(L_IN1, L_IN2, left)
+    motor(R_IN1, R_IN2, right)
+
+try:
+    while True:
+        time.sleep(0.1)
+
+        if k.is_pressed("q"):
+            v = min(v + 10, 100)
+        if k.is_pressed("e"):
+            v = max(v - 10, 0)
+        pl.ChangeDutyCycle(v)
+        pr.ChangeDutyCycle(v)
+
+        if k.is_pressed("w"):
+            drive(1, 1)      # 前進
+        elif k.is_pressed("s"):
+            drive(-1, -1)    # 後退
+        elif k.is_pressed("a"):
+            drive(-1, 1)     # 左旋回
+        elif k.is_pressed("d"):
+            drive(1, -1)     # 右旋回
+        else:
+            drive(0, 0)      # 何も押してなければ停止
+
+        if k.is_pressed("f"):
+            break
+finally:
+    pl.stop()
+    pr.stop()
+    G.cleanup()
