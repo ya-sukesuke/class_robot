@@ -96,7 +96,6 @@ if __name__ == "__main__":
             elif key == "5":
                 print("速度を変更します。")
                 print(f"現在の速度: {SPEED}")
-                print("新しい速度を入力してください。(0〜100)")
                 change_speed()
             elif key == "0":
                 print("終了します。")
