@@ -4,10 +4,15 @@ car_receiver.py - ノートPC(board_vision.py)から座標を受け取る（ラ�
 
 使い方:  python3 car_receiver.py
 受信データ例:
-  {"objects": [{"color": "red", "x": 120, "y": 250, "crossed": true, "rgb": [196, 30, 38]}],
-  color: red / orange / yellow / green / blue
+  {"objects": [{"id": "coneR", "color": "red", "x": 120, "y": 250,
+                "crossed": true, "registered": true, "rgb": [196, 40, 32]}, ...],
+   "missing": ["blockG"],
    "car": {"text": "car1", "x": 300, "y": 80, "angle": -90.0}, "t": 1731200000.1}
-  angle: 画像座標での車の向き[度]。右=0, 下=+90, 上=-90, 左=180
+  id:         ブラウザで登録した名前（未登録の物体は unknown1, unknown2 ...）
+  registered: 登録済みの物体なら true
+  missing:    登録したのに今見えていない物体の名前
+  color:      red / orange / yellow / green / blue
+  angle:      画像座標での車の向き[度]。右=0, 下=+90, 上=-90, 左=180
 """
 import socket, json, time
 
@@ -25,19 +30,20 @@ def stop_car():
 def control(data):
     """ここに車の制御を書く"""
     car = data.get("car")
-    targets = [o for o in data.get("objects", []) if o["crossed"]]
+    objs = {o["id"]: o for o in data.get("objects", [])}   # objs["coneR"] のように名前で取り出せる
+    targets = [o for o in objs.values() if o["crossed"]]
     if car is None:
         stop_car()          # 車(マーカー)が見えないときは止める
         return
     if targets:
         t = targets[0]
-        print(f"車({car['x']},{car['y']}) 向き{car['angle']}° → 目標({t['x']},{t['y']})")
+        print(f"車({car['x']},{car['y']}) 向き{car['angle']}° → 目標 {t['id']} ({t['x']},{t['y']})")
         # TODO: 目標へ向かうモータ制御
 
 last_print = 0
 while True:
     try:
-        msg, addr = sock.recvfrom(4096)
+        msg, addr = sock.recvfrom(65535)
     except socket.timeout:
         stop_car()
         continue
