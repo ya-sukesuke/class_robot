@@ -32,6 +32,8 @@ MIN_AREA = 150                # これより小さい色領域はノイズとし
 CAR_HOLD = 0.3                # QRを一瞬見失っても、この秒数は直前の位置を保持
 CAR_ANGLE_OFFSET = 0          # QRの上辺が車のどちらを向いているか: 前=0, 左=90, 右=-90, 後ろ=180
                               # （QRの中身は何でもOK。読んだ文字列は "text" として送るだけ）
+TRACK_DIST = 60               # 未登録の物体：前フレームからこの距離[px]以内なら同じ番号を引き継ぐ
+TRACK_TIMEOUT = 3.0           # 未登録の物体：見えなくなってもこの秒数は番号を保持
 PORT = 8000
 CONF = "board_config.json"    # 四隅・登録物体の保存先
 
@@ -82,35 +84,71 @@ def classify(rgb):
     return best
 
 class Tracker:
-    """登録した物体（名前つき）を、同じ色の中で一番近いものに対応づけて追跡する。
-    登録していない物体は unknown1, unknown2 ... とする"""
+    """・登録した物体（名前つき）：同じ色の中で一番近いものに対応づけて追跡
+       ・未登録の物体：red1, red2 ... と自動で通し番号（登録名と重ならない番号）"""
     def __init__(self):
         self.pos = {}          # 登録物体の最後に見えた位置  name -> (x, y)
+        self.auto = {}         # 未登録物体  "red1" -> {"color", "no", "x", "y", "t"}
+
+    @staticmethod
+    def _greedy(pairs):
+        """(距離, 検出index, キー) を近い順に1対1で確定"""
+        used_d, used_k, res = set(), set(), []
+        for _, i, k in sorted(pairs):
+            if i in used_d or k in used_k:
+                continue
+            used_d.add(i); used_k.add(k); res.append((i, k))
+        return res
 
     def update(self, dets):
+        now = time.time()
+        # 1) 登録済みの物体
         pairs = []
         for i, d in enumerate(dets):
             for o in cfg["objects"]:
                 if o["color"] == d["color"]:
                     px, py = self.pos.get(o["name"], (o["x"], o["y"]))
                     pairs.append((np.hypot(d["x"] - px, d["y"] - py), i, o["name"]))
-        pairs.sort()
-        used_d, used_n = set(), set()
-        for _, i, name in pairs:           # 近い組から順に確定
-            if i in used_d or name in used_n:
-                continue
-            used_d.add(i); used_n.add(name)
+        used_d, seen = set(), set()
+        for i, name in self._greedy(pairs):
+            used_d.add(i); seen.add(name)
             dets[i]["id"], dets[i]["registered"] = name, True
             self.pos[name] = (dets[i]["x"], dets[i]["y"])
 
-        unk = [d for i, d in enumerate(dets) if i not in used_d]
-        for n, d in enumerate(sorted(unk, key=lambda d: (d["x"], d["y"])), 1):
-            d["id"], d["registered"] = f"unknown{n}", False
+        # 2) 未登録の物体：前フレームの近い同色物体の番号を引き継ぐ
+        reg_names = {o["name"] for o in cfg["objects"]}
+        self.auto = {k: v for k, v in self.auto.items()
+                     if now - v["t"] < TRACK_TIMEOUT and k not in reg_names}
+        rest = [i for i in range(len(dets)) if i not in used_d]
+        pairs = []
+        for i in rest:
+            for k, t in self.auto.items():
+                if t["color"] == dets[i]["color"]:
+                    dist = np.hypot(dets[i]["x"] - t["x"], dets[i]["y"] - t["y"])
+                    if dist < TRACK_DIST:
+                        pairs.append((dist, i, k))
+        for i, k in self._greedy(pairs):
+            used_d.add(i)
+            self._auto_set(dets[i], k, self.auto[k]["no"], now)
+        # 新しく現れた物体：左→右の順に、空いている一番小さい番号
+        for i in sorted([i for i in rest if i not in used_d], key=lambda i: (dets[i]["x"], dets[i]["y"])):
+            color = dets[i]["color"]
+            taken = reg_names | set(self.auto)
+            no = 1
+            while f"{color}{no}" in taken:
+                no += 1
+            self._auto_set(dets[i], f"{color}{no}", no, now)
 
         names = [o["name"] for o in cfg["objects"]]
-        missing = [n for n in names if n not in used_n]
-        dets.sort(key=lambda d: (names.index(d["id"]) if d["registered"] else 999, d["x"]))
+        missing = [n for n in names if n not in seen]
+        colors = list(DEFAULT_COLORS)
+        dets.sort(key=lambda d: (0, names.index(d["id"]), 0) if d["registered"]
+                  else (1, colors.index(d["color"]), self.auto[d["id"]]["no"]))
         return dets, missing
+
+    def _auto_set(self, d, key, no, now):
+        d["id"], d["registered"] = key, False
+        self.auto[key] = {"color": d["color"], "no": no, "x": d["x"], "y": d["y"], "t": now}
 
     def forget(self, name=None):
         if name is None:
