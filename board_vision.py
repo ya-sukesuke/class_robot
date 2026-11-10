@@ -21,11 +21,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ===== 設定 =====
-PI_IP = "192.168.96.201"      # ラズパイのIPアドレス
+PI_IP = "192.168.96.201"        # ← ラズパイのIPアドレスに変更（ssh で使っているもの）
 PI_PORT = 5005                # car_receiver.py と合わせる
 SEND_HZ = 10                  # ラズパイへ送る頻度[回/秒]
-CAM_ID = 1                    # USBカメラ
-CAP_W, CAP_H = 640, 480       # QRが読めないときは 1280, 720 に上げると改善することがある
+CAM_ID = 1                    # ノートPC内蔵カメラが0なら、USBカメラは1のことが多い
+CAP_W, CAP_H = 640, 480
 BOARD_W, BOARD_H = 600, 400   # 補正後の盤面画像サイズ[px]。盤の実寸の縦横比に合わせる
 LINE_Y = 200                  # 補正後画像でこの y を超えた物体を「ライン越え」とする
 MIN_AREA = 150                # これより小さい色領域はノイズとして無視
