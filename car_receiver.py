@@ -4,7 +4,8 @@ car_receiver.py - ノートPC(board_vision.py)から座標を受け取る（ラ�
 
 使い方:  python3 car_receiver.py
 受信データ例:
-  {"objects": [{"x": 120, "y": 250, "crossed": true}],
+  {"objects": [{"color": "red", "x": 120, "y": 250, "crossed": true, "rgb": [196, 30, 38]}],
+  color: red / orange / yellow / green / blue
    "car": {"text": "car1", "x": 300, "y": 80, "angle": -90.0}, "t": 1731200000.1}
   angle: 画像座標での車の向き[度]。右=0, 下=+90, 上=-90, 左=180
 """

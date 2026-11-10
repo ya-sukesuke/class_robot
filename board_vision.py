@@ -4,7 +4,8 @@ board_vision.py - 天井Webカメラで盤面を認識（ノートPCで実行）
 
   - Webカメラは ノートPC に USB 接続
   - 盤の四隅をブラウザ上でクリック → 真上視点に射影変換
-  - RGB の範囲で物体を検出し、座標とライン越えを判定
+  - 色の濃い領域（彩度が高い所）を物体として拾い、RGBで一番近い色に分類
+    （黒い盤・白線・ロープは彩度がほぼ0なので自動で除外される）
   - 車に貼った QRコード で車の位置と向きを検出
   - 結果を UDP でラズパイ（car_receiver.py）へ送信
 
@@ -27,14 +28,22 @@ CAP_W, CAP_H = 640, 480       # QRが読めないときは 1280, 720 に上げ�
 BOARD_W, BOARD_H = 600, 400   # 補正後の盤面画像サイズ[px]。盤の実寸の縦横比に合わせる
 LINE_Y = 200                  # 補正後画像でこの y を超えた物体を「ライン越え」とする
 MIN_AREA = 150                # これより小さい色領域はノイズとして無視
-PICK_MARGIN = 40              # 盤面クリックで色を拾うときの ±範囲
 CAR_HOLD = 0.3                # QRを一瞬見失っても、この秒数は直前の位置を保持
 PORT = 8000
-CONF = "board_config.json"    # 四隅とRGB閾値の保存先
+CONF = "board_config.json"    # 四隅・基準色の保存先
 
-cfg = {"corners": [], "rgb_lo": [150, 0, 0], "rgb_hi": [255, 90, 90]}   # 初期値は赤
+# 基準色(RGB)。初期値は盤の写真から測った値。ブラウザで物体をクリックすれば更新できる
+DEFAULT_COLORS = {
+    "red":    [200, 32, 35],
+    "orange": [213, 148, 11],
+    "yellow": [220, 194, 11],
+    "green":  [10, 130, 101],
+    "blue":   [15, 78, 190],
+}
+cfg = {"corners": [], "chroma_min": 60, "colors": DEFAULT_COLORS}
 if os.path.exists(CONF):
     cfg.update(json.load(open(CONF)))
+    cfg.pop("rgb_lo", None); cfg.pop("rgb_hi", None)   # 旧形式の設定は無視
 
 def save():
     json.dump(cfg, open(CONF, "w"))
@@ -51,6 +60,17 @@ def order(pts):
     s, d = pts.sum(1), np.diff(pts, axis=1).ravel()
     return np.array([pts[s.argmin()], pts[d.argmin()],
                      pts[s.argmax()], pts[d.argmax()]], np.float32)
+
+def classify(rgb):
+    """平均RGBを一番近い基準色に分類。明るさの影響を減らすため r:g:b の比率で比べる"""
+    v = np.array(rgb, float); v = v / (v.sum() + 1e-6)
+    best, bd = None, 1e9
+    for name, ref in cfg["colors"].items():
+        r = np.array(ref, float); r = r / (r.sum() + 1e-6)
+        d = np.linalg.norm(v - r)
+        if d < bd:
+            best, bd = name, d
+    return best
 
 def detect_car(frame, M):
     """QRを元のカメラ画像で検出し（解像度が高い方が読みやすい）、盤面座標に変換"""
@@ -91,9 +111,7 @@ def loop():
             time.sleep(0.05)
             continue
         corners4 = list(cfg["corners"])
-        # OpenCVの画像は BGR 順なので、RGB設定を並べ替えて使う
-        lo = np.array(cfg["rgb_lo"][::-1], np.uint8)
-        hi = np.array(cfg["rgb_hi"][::-1], np.uint8)
+        chroma_min = cfg["chroma_min"]
 
         raw = frame.copy()
         for i, (x, y) in enumerate(corners4):
@@ -108,8 +126,10 @@ def loop():
             vis = board.copy()
             cv2.line(vis, (0, LINE_Y), (BOARD_W, LINE_Y), (0, 255, 255), 2)
 
-            # --- RGBで物体検出 ---
-            mask = cv2.inRange(blur, lo, hi)
+            # --- 色の濃い領域 = 物体 ---
+            b16 = blur.astype(np.int16)
+            chroma = b16.max(2) - b16.min(2)          # RGBの最大-最小（白・黒・灰色は小さい）
+            mask = ((chroma > chroma_min) * 255).astype(np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
             cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in cnts:
@@ -117,11 +137,20 @@ def loop():
                     continue
                 m = cv2.moments(c)
                 cx, cy = int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"])
+                inner = np.zeros(mask.shape, np.uint8)
+                cv2.drawContours(inner, [c], -1, 255, -1)
+                bb, gg, rr = cv2.mean(blur, inner & mask)[:3]
+                rgb = [int(rr), int(gg), int(bb)]
+                name = classify(rgb)
                 crossed = cy > LINE_Y
-                out["objects"].append({"x": cx, "y": cy, "crossed": crossed})
-                cv2.drawContours(vis, [c], -1, (0, 0, 255) if crossed else (0, 255, 0), 2)
-                cv2.circle(vis, (cx, cy), 4, (255, 0, 0), -1)
-                cv2.putText(vis, f"({cx},{cy})", (cx + 6, cy), font, 0.5, (255, 0, 0), 1)
+                out["objects"].append({"color": name, "x": cx, "y": cy,
+                                       "crossed": crossed, "rgb": rgb})
+                ref = cfg["colors"][name]
+                cv2.drawContours(vis, [c], -1, (ref[2], ref[1], ref[0]), 3)
+                cv2.drawContours(vis, [c], -1, (255, 255, 255) if crossed else (0, 0, 0), 1)
+                cv2.circle(vis, (cx, cy), 4, (255, 255, 255), -1)
+                cv2.putText(vis, f"{name}{' !' if crossed else ''} ({cx},{cy})",
+                            (cx + 6, cy), font, 0.5, (255, 255, 255), 1)
 
             # --- QRで車検出 ---
             car = detect_car(frame, M)
@@ -168,10 +197,12 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Board Vision</title>
 <p>① RAW映像で盤の四隅を4回クリック（順番自由。5回目でやり直し）
 <button onclick="fetch('/reset')">四隅リセット</button></p>
 <img id=raw src=/stream/raw style="cursor:crosshair">
-<p>② 補正後の盤面：<b>検出したい物体をクリックすると、その色が自動で範囲に設定されます</b> / 右は色マスク（白=検出）</p>
+<p>② 補正後の盤面 / 右は物体マスク（白=物体として拾った所）</p>
 <img id=board src=/stream/board style="cursor:crosshair"> <img src=/stream/mask width=300>
-<p>③ RGB範囲の微調整（マスクで物体だけが白くなるように。自動保存）</p>
-<div id=sl></div>
+<p>③ 色の登録：色名を選んで、盤面のその色の物体をクリック → 基準色が更新されます（自動保存）<br>
+<select id=cname></select> <span id=chips></span></p>
+<p>彩度しきい値 <input type=range id=cm min=10 max=200 oninput="setcm()"> <span id=cmv></span>
+（白線や影まで拾うなら上げる／物体が欠けるなら下げる）</p>
 <pre id=out></pre>
 <script>
 function pos(img, e) {
@@ -181,20 +212,18 @@ function pos(img, e) {
 }
 raw.onclick = e => { const [x, y] = pos(raw, e); fetch(`/click?x=${x}&y=${y}`); };
 board.onclick = e => { const [x, y] = pos(board, e);
-  fetch(`/pick?x=${x}&y=${y}`).then(load); };
-const names = ["R_lo","G_lo","B_lo","R_hi","G_hi","B_hi"];
+  fetch(`/pick?x=${x}&y=${y}&name=${cname.value}`).then(load); };
 function load() {
   fetch('/cfg').then(r => r.json()).then(c => {
-    const v = [...c.rgb_lo, ...c.rgb_hi];
-    sl.innerHTML = names.map((n, i) =>
-      `${n} <input type=range id=${n} min=0 max=255 value=${v[i]} oninput="send()"> <span id=${n}v>${v[i]}</span><br>`).join('');
+    const sel = cname.value;
+    cname.innerHTML = Object.keys(c.colors).map(n => `<option>${n}</option>`).join('');
+    if (sel) cname.value = sel;
+    chips.innerHTML = Object.entries(c.colors).map(([n, v]) =>
+      `<span style="display:inline-block;padding:2px 8px;margin:2px;color:#fff;background:rgb(${v})">${n} (${v})</span>`).join('');
+    cm.value = c.chroma_min; cmv.textContent = c.chroma_min;
   });
 }
-function send() {
-  const v = names.map(n => { const e = document.getElementById(n);
-    document.getElementById(n + 'v').textContent = e.value; return e.value; });
-  fetch('/rgb?v=' + v.join(','));
-}
+function setcm() { cmv.textContent = cm.value; fetch('/chroma?v=' + cm.value); }
 load();
 setInterval(() => fetch('/result').then(r => r.json())
   .then(j => out.textContent = JSON.stringify(j, null, 1)), 500);
@@ -241,18 +270,16 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/pick":
             with lock:
                 img = latest_board
-            if img is not None:
+            name = q.get("name", [""])[0]
+            if img is not None and name in cfg["colors"]:
                 x, y = int(float(q["x"][0])), int(float(q["y"][0]))
                 patch = img[max(0, y - 3):y + 4, max(0, x - 3):x + 4].reshape(-1, 3)
                 b, g, r = patch.mean(0)
-                rgb = [int(r), int(g), int(b)]
-                cfg["rgb_lo"] = [max(0, v - PICK_MARGIN) for v in rgb]
-                cfg["rgb_hi"] = [min(255, v + PICK_MARGIN) for v in rgb]
+                cfg["colors"] = {**cfg["colors"], name: [int(r), int(g), int(b)]}
                 save()
-                print("クリックした色 RGB =", rgb)
-        elif u.path == "/rgb":
-            v = [int(x) for x in q["v"][0].split(",")]
-            cfg["rgb_lo"], cfg["rgb_hi"] = v[:3], v[3:]
+                print(f"{name} の基準色を RGB={cfg['colors'][name]} に更新")
+        elif u.path == "/chroma":
+            cfg["chroma_min"] = int(q["v"][0])
             save()
         elif u.path == "/cfg":
             return self.reply(json.dumps(cfg).encode(), "application/json")
