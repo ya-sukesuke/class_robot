@@ -8,7 +8,7 @@ car_receiver.py - ノートPC(board_vision.py)から座標を受け取る（ラ�
                 "crossed": true, "registered": true, "rgb": [196, 40, 32]}, ...],
    "missing": ["blockG"],
    "car": {"text": "car1", "x": 300, "y": 80, "angle": -90.0}, "t": 1731200000.1}
-  id:         ブラウザで登録した名前（未登録の物体は unknown1, unknown2 ...）
+  id:         ブラウザで登録した名前（未登録の物体は red1, blue2 ... と色+通し番号。見分けは registered で）
   registered: 登録済みの物体なら true
   missing:    登録したのに今見えていない物体の名前
   color:      red / orange / yellow / green / blue

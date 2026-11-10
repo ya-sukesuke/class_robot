@@ -53,6 +53,7 @@ if os.path.exists(CONF):
     cfg.update(json.load(open(CONF)))
     for k in ("rgb_lo", "rgb_hi"):            # 旧形式の設定は無視
         cfg.pop(k, None)
+cfg["objects"] = []   # 部屋の明るさで色が変わるので、物体は起動のたびにクリックで登録し直す（四隅としきい値は引き継ぐ）
 
 def save():
     json.dump(cfg, open(CONF, "w"), ensure_ascii=False, indent=1)
@@ -72,8 +73,12 @@ def order(pts):
 
 def classify(rgb):
     """平均RGBを一番近いお手本の色に分類。明るさの影響を減らすため r:g:b の比率で比べる。
-    お手本 = 初期の5色 + 登録した各物体の実測色"""
-    refs = list(cfg["colors"].items()) + [(o["color"], o["rgb"]) for o in cfg["objects"]]
+    お手本 = 登録した各物体の実測色 + まだ1つも登録していない色の初期値
+    （登録した色は初期値を使わない。初期値は別の部屋で測った値なので、今の明るさとずれるため）"""
+    objects = cfg["objects"]
+    reg_colors = {o["color"] for o in objects}
+    refs = [(c, v) for c, v in cfg["colors"].items() if c not in reg_colors] + \
+           [(o["color"], o["rgb"]) for o in objects]
     v = np.array(rgb, float); v = v / (v.sum() + 1e-6)
     best, bd = None, 1e9
     for name, ref in refs:
@@ -85,10 +90,12 @@ def classify(rgb):
 
 class Tracker:
     """・登録した物体（名前つき）：同じ色の中で一番近いものに対応づけて追跡
+         （最近まで見えていた物体は TRACK_DIST 以内の物体にだけ引き継ぐ。
+           盤から外れた直後に、遠くの同色の物体へ名前が飛ぶのを防ぐ）
        ・未登録の物体：red1, red2 ... と自動で通し番号（登録名と重ならない番号）"""
     def __init__(self):
-        self.pos = {}          # 登録物体の最後に見えた位置  name -> (x, y)
-        self.auto = {}         # 未登録物体  "red1" -> {"color", "no", "x", "y", "t"}
+        self.pos = {}          # 登録物体の最後に見えた位置と時刻  name -> (x, y, t)
+        self.auto = {}         # 未登録物体  "red1" -> {"color", "x", "y", "t"}
 
     @staticmethod
     def _greedy(pairs):
@@ -102,21 +109,25 @@ class Tracker:
 
     def update(self, dets):
         now = time.time()
+        objects = cfg["objects"]   # HTTP側はリストを丸ごと差し替えるので、1フレーム中はこの参照を使う
         # 1) 登録済みの物体
         pairs = []
-        for i, d in enumerate(dets):
-            for o in cfg["objects"]:
+        for o in objects:
+            px, py, pt = self.pos.get(o["name"], (o["x"], o["y"], 0))
+            recent = now - pt < TRACK_TIMEOUT
+            for i, d in enumerate(dets):
                 if o["color"] == d["color"]:
-                    px, py = self.pos.get(o["name"], (o["x"], o["y"]))
-                    pairs.append((np.hypot(d["x"] - px, d["y"] - py), i, o["name"]))
+                    dist = np.hypot(d["x"] - px, d["y"] - py)
+                    if not recent or dist < TRACK_DIST:
+                        pairs.append((dist, i, o["name"]))
         used_d, seen = set(), set()
         for i, name in self._greedy(pairs):
             used_d.add(i); seen.add(name)
             dets[i]["id"], dets[i]["registered"] = name, True
-            self.pos[name] = (dets[i]["x"], dets[i]["y"])
+            self.pos[name] = (dets[i]["x"], dets[i]["y"], now)
 
         # 2) 未登録の物体：前フレームの近い同色物体の番号を引き継ぐ
-        reg_names = {o["name"] for o in cfg["objects"]}
+        reg_names = {o["name"] for o in objects}
         self.auto = {k: v for k, v in self.auto.items()
                      if now - v["t"] < TRACK_TIMEOUT and k not in reg_names}
         rest = [i for i in range(len(dets)) if i not in used_d]
@@ -129,30 +140,33 @@ class Tracker:
                         pairs.append((dist, i, k))
         for i, k in self._greedy(pairs):
             used_d.add(i)
-            self._auto_set(dets[i], k, self.auto[k]["no"], now)
+            self._auto_set(dets[i], k, now)
         # 新しく現れた物体：左→右の順に、空いている一番小さい番号
+        taken = reg_names | set(self.auto)
         for i in sorted([i for i in rest if i not in used_d], key=lambda i: (dets[i]["x"], dets[i]["y"])):
             color = dets[i]["color"]
-            taken = reg_names | set(self.auto)
             no = 1
             while f"{color}{no}" in taken:
                 no += 1
-            self._auto_set(dets[i], f"{color}{no}", no, now)
+            taken.add(f"{color}{no}")
+            self._auto_set(dets[i], f"{color}{no}", now)
 
-        names = [o["name"] for o in cfg["objects"]]
+        names = [o["name"] for o in objects]
         missing = [n for n in names if n not in seen]
-        colors = list(DEFAULT_COLORS)
-        dets.sort(key=lambda d: (0, names.index(d["id"]), 0) if d["registered"]
-                  else (1, colors.index(d["color"]), self.auto[d["id"]]["no"]))
+        order_r = {n: i for i, n in enumerate(names)}
+        order_c = {c: i for i, c in enumerate(DEFAULT_COLORS)}   # 5色以外の色は後ろへ
+        dets.sort(key=lambda d: (0, order_r.get(d["id"], len(names)), "", 0) if d["registered"]
+                  else (1, order_c.get(d["color"], len(order_c)), d["color"], int(d["id"][len(d["color"]):])))
         return dets, missing
 
-    def _auto_set(self, d, key, no, now):
+    def _auto_set(self, d, key, now):
         d["id"], d["registered"] = key, False
-        self.auto[key] = {"color": d["color"], "no": no, "x": d["x"], "y": d["y"], "t": now}
+        self.auto[key] = {"color": d["color"], "x": d["x"], "y": d["y"], "t": now}
 
     def forget(self, name=None):
         if name is None:
             self.pos.clear()
+            self.auto.clear()
         else:
             self.pos.pop(name, None)
 
@@ -244,7 +258,7 @@ def loop():
                 cv2.drawContours(vis, [c], -1, col, 3)
                 cv2.drawContours(vis, [c], -1, (255, 255, 255) if d["crossed"] else (0, 0, 0), 1)
                 cv2.circle(vis, (cx, cy), 4, (255, 255, 255), -1)
-                label = d["id"] if d["registered"] else f"? ({d['color']})"
+                label = d["id"] if d["registered"] else f"{d['id']}?"
                 cv2.putText(vis, f"{label}{' !' if d['crossed'] else ''}", (cx + 6, cy - 4),
                             font, 0.55, (255, 255, 255), 2)
                 cv2.putText(vis, f"({cx},{cy})", (cx + 6, cy + 12), font, 0.4, (255, 255, 255), 1)
@@ -307,6 +321,8 @@ def register(x, y, color, name):
             hit = d
     if hit is None:
         return "物体が見つかりません。物体の上をクリックしてください"
+    if name in tracker.auto and hit["id"] != name:
+        return f"{name} は別の未登録の物体が使っています。別の名前にしてください"
     # 同じ名前、または同じ物体（すでに登録済み）の古い登録は消す
     objs = [o for o in cfg["objects"]
             if o["name"] != name and not (hit.get("registered") and o["name"] == hit["id"])]
@@ -315,7 +331,7 @@ def register(x, y, color, name):
             tracker.forget(o["name"])
     objs.append({"name": name, "color": color, "rgb": hit["rgb"], "x": hit["x"], "y": hit["y"]})
     cfg["objects"] = objs
-    tracker.pos[name] = (hit["x"], hit["y"])
+    tracker.pos[name] = (hit["x"], hit["y"], time.time())
     save()
     print(f"登録: {name} = {color}  RGB={hit['rgb']}  位置=({hit['x']},{hit['y']})")
     return "ok"
@@ -354,8 +370,9 @@ board.onclick = e => {
   fetch(`/register?x=${x}&y=${y}&color=${color.value}&name=${encodeURIComponent(n)}`)
     .then(r => r.text()).then(t => { msg.textContent = t == 'ok' ? '' : t; load(); });
 };
-function suggest() {              // 次の空き番号を提案（red1, red2 ...）
-  const used = new Set(objs.map(o => o.name));
+let autoIds = [];
+function suggest() {              // 次の空き番号を提案（red1, red2 ...）。未登録の物体が使っている番号も避ける
+  const used = new Set(objs.map(o => o.name).concat(autoIds));
   let i = 1; while (used.has(color.value + i)) i++;
   name.value = color.value + i;
 }
@@ -374,7 +391,10 @@ function load() {
 function setcm() { cmv.textContent = cm.value; fetch('/chroma?v=' + cm.value); }
 load();
 setInterval(() => fetch('/result').then(r => r.json())
-  .then(j => out.textContent = JSON.stringify(j, null, 1)), 500);
+  .then(j => {
+    out.textContent = JSON.stringify(j, null, 1);
+    autoIds = (j.objects || []).filter(o => !o.registered).map(o => o.id);
+  }), 500);
 </script>"""
 
 class Handler(BaseHTTPRequestHandler):
