@@ -10,13 +10,14 @@ board_vision.py - 天井Webカメラで盤面を認識（ノートPCで実行）
   - 車に貼った ArUcoマーカー（または QRコード）で車の位置と向きを検出
   - 結果を UDP でラズパイ（car_receiver.py）へ送信
 
-使い方:  pip install opencv-python numpy
+使い方:  pip install opencv-python numpy   （ArUco を使うなら OpenCV 4.7 以降。古い場合は opencv-contrib-python）
          python board_vision.py
+         python board_vision.py --marker   ← 印刷用の ArUcoマーカー画像 aruco_marker.png を作る
          ブラウザで http://localhost:8000 を開く
 """
 import cv2
 import numpy as np
-import json, threading, time, os, socket, sys
+import json, threading, time, os, socket, sys, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -32,12 +33,15 @@ LINE_Y = 200                  # 補正後画像でこの y を超えた物体を
 MIN_AREA = 150                # これより小さい色領域はノイズとして無視
 CAR_HOLD = 0.3                # QRを一瞬見失っても、この秒数は直前の位置を保持
 CAR_MARKER = "auto"           # 車の目印: "aruco"（推奨・小さくても読める） / "qr" / "auto"（両方探す）
+ARUCO_ID = 0                  # 車に貼る ArUcoマーカーの ID（DICT_4X4_50）。これ以外のIDは無視する
 CAR_ANGLE_OFFSET = 0          # マーカー(QR)の上辺が車のどちらを向いているか: 前=0, 左=90, 右=-90, 後ろ=180
                               # （QRの中身は何でもOK。読んだ文字列は "text" として送るだけ）
 TRACK_DIST = 60               # 未登録の物体：前フレームからこの距離[px]以内なら同じ番号を引き継ぐ
 TRACK_TIMEOUT = 3.0           # 未登録の物体：見えなくなってもこの秒数は番号を保持
 PORT = 8000
 CONF = "board_config.json"    # 四隅・登録物体の保存先
+SNAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")   # 画像保存ボタンの保存先
+MAX_UPSCALE_PX = 2600         # マーカー探索で拡大するときの画像の長辺の上限[px]（大きいと遅い）
 
 # 色の初期お手本(RGB)。盤の写真から測った値。物体を登録すると、その物体の実測色もお手本に加わる
 DEFAULT_COLORS = {
@@ -62,16 +66,23 @@ def save():
 qr = cv2.QRCodeDetector()
 QR_DETECTORS = ([cv2.QRCodeDetectorAruco()] if hasattr(cv2, "QRCodeDetectorAruco") else []) + [qr]
 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-# ArUco（OpenCV 4.7以降/以前の両方に対応）。印刷用マーカーは aruco_marker.pdf（DICT_4X4_50 の ID 0）
-_adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-if hasattr(cv2.aruco, "ArucoDetector"):
-    _adet = cv2.aruco.ArucoDetector(_adict, cv2.aruco.DetectorParameters())
-    detect_aruco = lambda g: _adet.detectMarkers(g)
-else:
-    _ap = cv2.aruco.DetectorParameters_create()
-    detect_aruco = lambda g: cv2.aruco.detectMarkers(g, _adict, parameters=_ap)
+# ArUco（OpenCV 4.7以降/以前の両方に対応）。印刷用マーカーは `python board_vision.py --marker` で作る
+# （DICT_4X4_50 の ARUCO_ID 番）。aruco モジュールが無い OpenCV では QR だけで動く
+_adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50) if hasattr(cv2, "aruco") else None
+detect_aruco = None
+if CAR_MARKER in ("aruco", "auto") and _adict is not None:
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        _adet = cv2.aruco.ArucoDetector(_adict, cv2.aruco.DetectorParameters())
+        detect_aruco = lambda g: _adet.detectMarkers(g)
+    else:
+        _ap = cv2.aruco.DetectorParameters_create()
+        detect_aruco = lambda g: cv2.aruco.detectMarkers(g, _adict, parameters=_ap)
+elif CAR_MARKER in ("aruco", "auto"):
+    print("この OpenCV には aruco モジュールがありません。QRコードだけで車を探します"
+          "（ArUco を使うなら pip install -U opencv-python で 4.7 以降に）")
+    CAR_MARKER = "qr"
 latest_frame = None           # 画像保存ボタン用
-qr_state = {"c": None, "size": 0, "text": "", "text_t": 0, "found": False}   # 前回見つけたQR（カメラ画像の座標）
+qr_state = {"c": None, "size": 0, "text": "", "text_t": 0, "found": False, "kind": None}   # 前回見つけたQR（カメラ画像の座標）
 raw_scale = 1.0               # カメラ画像 ÷ ブラウザ表示 の倍率（クリック座標の換算用）
 lock = threading.Lock()
 tlock = threading.Lock()       # 追跡データ（tracker・登録）用
@@ -181,24 +192,41 @@ class Tracker:
 tracker = Tracker()
 
 def _find_aruco(gray):
-    """ArUcoマーカーの4隅を探す（等倍→2倍に拡大）。戻り値: (4隅, ID) または None"""
+    """ID が ARUCO_ID の ArUcoマーカーの4隅を探す（等倍→2倍に拡大）。戻り値: (4隅, ID) または None"""
+    if detect_aruco is None:
+        return None
+    h, w = gray.shape[:2]
     for s in (1, 2):
+        if s > 1 and max(h, w) * s > MAX_UPSCALE_PX:   # 拡大しすぎると遅いので上限
+            break
         g = gray if s == 1 else cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
         corners, ids, _ = detect_aruco(g)
-        if ids is not None and len(ids):
-            return np.asarray(corners[0]).reshape(4, 2) / s, int(np.asarray(ids).ravel()[0])
+        if ids is None:
+            continue
+        for c, i in zip(corners, np.asarray(ids).ravel()):
+            if int(i) == ARUCO_ID:                     # 他のIDのマーカーや誤検出は無視
+                return np.asarray(c).reshape(4, 2) / s, int(i)
     return None
 
 def _find_marker(gray):
-    """戻り値: (4隅, 種類, QRを見つけた画像, 倍率) または None"""
+    """戻り値: (4隅, 種類, QRを見つけた画像, 倍率) または None
+    auto のときは前回見つかった種類を先に試す（毎フレーム無駄な探索をしないため）"""
+    kinds = []
     if CAR_MARKER in ("aruco", "auto"):
-        hit = _find_aruco(gray)
-        if hit:
-            return hit[0], f"aruco{hit[1]}", None, 1
+        kinds.append("aruco")
     if CAR_MARKER in ("qr", "auto"):
-        hit = _find_qr(gray)
-        if hit:
-            return hit[0], "qr", hit[1], hit[2]
+        kinds.append("qr")
+    if qr_state["kind"] == "qr" and kinds == ["aruco", "qr"]:
+        kinds = ["qr", "aruco"]
+    for k in kinds:
+        if k == "aruco":
+            hit = _find_aruco(gray)
+            if hit:
+                return hit[0], f"aruco{hit[1]}", None, 1
+        else:
+            hit = _find_qr(gray)
+            if hit:
+                return hit[0], "qr", hit[1], hit[2]
     return None
 
 def _find_qr(gray):
@@ -206,7 +234,7 @@ def _find_qr(gray):
     戻り値: (4隅[元画像の座標], 見つけた画像, 倍率) または None"""
     h, w = gray.shape[:2]
     for s in (1, 2, 3):
-        if s > 1 and max(h, w) * s > 2600:      # 拡大しすぎると遅いので上限
+        if s > 1 and max(h, w) * s > MAX_UPSCALE_PX:   # 拡大しすぎると遅いので上限
             break
         g = gray if s == 1 else cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
         for im in (g, clahe.apply(g)):
@@ -248,6 +276,9 @@ def detect_car(frame, M, corners):
     qr_state["c"] = pts.mean(0)
     qr_state["size"] = float(np.linalg.norm(pts[0] - pts[2]) / 1.414)
     qr_state["found"] = True
+    if ("qr" if kind == "qr" else "aruco") != qr_state["kind"]:   # 種類が変わったら前の文字列は使わない
+        qr_state["text"], qr_state["text_t"] = "", 0
+    qr_state["kind"] = "qr" if kind == "qr" else "aruco"
     # 中身の文字列は1秒に1回だけ読む（位置と向きには不要で、読むのは重いため）
     if kind != "qr":
         qr_state["text"] = kind                      # ArUco は "aruco0" のようにIDを入れる
@@ -305,6 +336,7 @@ def loop():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     last_print = last_send = 0
     last_car, last_car_t = None, 0
+    last_err_t = 0
 
     while True:
         ok, frame = cap.read()
@@ -375,9 +407,13 @@ def loop():
             # --- QRで車検出 ---
             try:
                 car = detect_car(frame, M, corners4)
-            except Exception as e:                 # 検出で予期しないエラーが出ても認識ループは止めない
-                print("車の検出でエラー:", e)
-                car, qr_state["found"] = None, False
+            except Exception:                      # 検出で予期しないエラーが出ても認識ループは止めない
+                if time.time() - last_err_t > 5:   # 毎フレーム出すと読めないので5秒に1回
+                    last_err_t = time.time()
+                    print("車の検出でエラー（プログラムの不具合の可能性）:")
+                    traceback.print_exc()
+                car = None
+                qr_state["c"], qr_state["found"] = None, False
             now = time.time()
             if car:
                 last_car, last_car_t = car, now
@@ -616,10 +652,19 @@ class Handler(BaseHTTPRequestHandler):
                 f = None if latest_frame is None else latest_frame.copy()
             if f is None:
                 return self.reply("まだ画像がありません".encode())
-            fn = time.strftime("snapshot_%H%M%S.png")
-            cv2.imwrite(fn, f)
-            print("保存:", os.path.abspath(fn))
-            return self.reply(f"{os.path.abspath(fn)} に保存しました".encode())
+            now = time.time()
+            fn = os.path.join(SNAP_DIR, time.strftime("snapshot_%Y%m%d_%H%M%S", time.localtime(now))
+                              + f"_{int(now * 1000) % 1000:03d}.png")
+            try:
+                os.makedirs(SNAP_DIR, exist_ok=True)
+                ok = cv2.imwrite(fn, f)
+            except (OSError, cv2.error):
+                ok = False
+            if not ok:
+                print("保存に失敗:", fn)
+                return self.reply(f"{fn} に保存できませんでした".encode())
+            print("保存:", fn)
+            return self.reply(f"{fn} に保存しました".encode())
         elif u.path == "/reset":
             cfg["corners"] = []
             save()
@@ -663,7 +708,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(body, "application/json")
         self.reply(b"ok")
 
+def make_marker(fn="aruco_marker.png", px=600):
+    """印刷用の ArUcoマーカー（DICT_4X4_50 の ARUCO_ID 番、周りに白い余白つき）を画像で保存する"""
+    if _adict is None:
+        sys.exit("この OpenCV には aruco モジュールがありません（pip install -U opencv-python）")
+    if hasattr(cv2.aruco, "generateImageMarker"):
+        img = cv2.aruco.generateImageMarker(_adict, ARUCO_ID, px)
+    else:
+        img = cv2.aruco.drawMarker(_adict, ARUCO_ID, px)
+    img = cv2.copyMakeBorder(img, px // 6, px // 6, px // 6, px // 6, cv2.BORDER_CONSTANT, value=255)
+    if not cv2.imwrite(fn, img):
+        sys.exit(f"{fn} に保存できませんでした")
+    print(f"{os.path.abspath(fn)} を保存しました（DICT_4X4_50, ID {ARUCO_ID}）。白い余白ごと印刷して車に貼ってください")
+
 if __name__ == "__main__":
+    if "--marker" in sys.argv:
+        make_marker()
+        sys.exit()
     threading.Thread(target=loop, daemon=True).start()
     print(f"ブラウザで http://localhost:{PORT} を開いてください（送信先 {PI_IP}:{PI_PORT}）")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
