@@ -25,7 +25,8 @@ PI_IP = "192.168.96.201"      # ラズパイのIPアドレス
 PI_PORT = 5005                # car_receiver.py と合わせる
 SEND_HZ = 10                  # ラズパイへ送る頻度[回/秒]
 CAM_ID = 1                    # USBカメラ
-CAP_W, CAP_H = 640, 480       # QRが読めないときは 1280, 720 に上げると改善することがある
+CAP_W, CAP_H = 1920, 1080     # カメラの解像度（高いほどQRが読みやすい。非対応なら自動で下がる）
+RAW_VIEW_W = 960              # ブラウザに表示するカメラ映像の横幅[px]（表示用に縮小するだけ）
 BOARD_W, BOARD_H = 600, 400   # 補正後の盤面画像サイズ[px]。盤の実寸の縦横比に合わせる
 LINE_Y = 200                  # 補正後画像でこの y を超えた物体を「ライン越え」とする
 MIN_AREA = 150                # これより小さい色領域はノイズとして無視
@@ -58,6 +59,10 @@ def save():
     json.dump(cfg, open(CONF, "w"), ensure_ascii=False, indent=1)
 
 qr = cv2.QRCodeDetector()
+QR_DETECTORS = ([cv2.QRCodeDetectorAruco()] if hasattr(cv2, "QRCodeDetectorAruco") else []) + [qr]
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+qr_state = {"c": None, "size": 0, "text": "", "text_t": 0, "found": False}   # 前回見つけたQR（カメラ画像の座標）
+raw_scale = 1.0               # カメラ画像 ÷ ブラウザ表示 の倍率（クリック座標の換算用）
 lock = threading.Lock()
 tlock = threading.Lock()       # 追跡データ（tracker・登録）用
 jpgs = {"raw": None, "board": None, "mask": None}
@@ -165,14 +170,62 @@ class Tracker:
 
 tracker = Tracker()
 
-def detect_car(frame, M):
-    """QRを元のカメラ画像で検出し（解像度が高い方が読みやすい）、盤面座標に変換"""
-    text, pts, _ = qr.detectAndDecode(frame)
-    if pts is None:
-        ok, pts = qr.detect(frame)      # 読めなくても位置だけ取れることがある
-        if not ok or pts is None:
-            return None
-        text = ""
+def _find_qr(gray):
+    """白黒画像からQRの4隅を探す。小さいQRのため、拡大・コントラスト強調・2種類の検出器を順に試す。
+    戻り値: (4隅[元画像の座標], 見つけた画像, 倍率) または None"""
+    h, w = gray.shape[:2]
+    for s in (1, 2, 3):
+        if s > 1 and max(h, w) * s > 2600:      # 拡大しすぎると遅いので上限
+            break
+        g = gray if s == 1 else cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+        for im in (g, clahe.apply(g)):
+            for det in QR_DETECTORS:
+                try:
+                    ok, p = det.detect(im)
+                except cv2.error:
+                    continue
+                if ok and p is not None and p.size == 8:
+                    return p.reshape(4, 2) / s, im, s
+    return None
+
+def detect_car(frame, M, corners):
+    """QRを元のカメラ画像（高解像度）で探し、盤面座標に変換する"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    H, W = gray.shape
+    found = None
+    # 1) 前回見つけた場所の周辺だけを拡大して探す（速くて小さいQRにも強い）
+    if qr_state["c"] is not None:
+        cx, cy = qr_state["c"]
+        r = int(max(qr_state["size"] * 2.5, 80))
+        x0, y0 = max(0, int(cx) - r), max(0, int(cy) - r)
+        x1, y1 = min(W, int(cx) + r), min(H, int(cy) + r)
+        hit = _find_qr(gray[y0:y1, x0:x1])
+        if hit:
+            found = (hit[0] + [x0, y0], hit[1], hit[2], (x0, y0))
+    # 2) 見つからなければ盤の範囲全体を探す
+    if found is None:
+        c = np.array(corners)
+        x0, y0 = np.maximum(c.min(0).astype(int) - 20, 0)
+        x1, y1 = np.minimum(c.max(0).astype(int) + 20, [W, H])
+        hit = _find_qr(gray[y0:y1, x0:x1])
+        if hit:
+            found = (hit[0] + [x0, y0], hit[1], hit[2], (x0, y0))
+    if found is None:
+        qr_state["c"], qr_state["found"] = None, False
+        return None
+    pts, im, sc, (ox, oy) = found
+    qr_state["c"] = pts.mean(0)
+    qr_state["size"] = float(np.linalg.norm(pts[0] - pts[2]) / 1.414)
+    qr_state["found"] = True
+    # 中身の文字列は1秒に1回だけ読む（位置と向きには不要で、読むのは重いため）
+    if time.time() - qr_state["text_t"] > 1.0:
+        qr_state["text_t"] = time.time()
+        try:
+            t, _ = qr.decode(im, ((pts - [ox, oy]) * sc).astype(np.float32).reshape(1, 4, 2))
+            if t:
+                qr_state["text"] = t
+        except cv2.error:
+            pass
     # QRの4隅は QR自身の向きで 左上,右上,右下,左下 の順に返る
     p = cv2.perspectiveTransform(pts.reshape(-1, 1, 2).astype(np.float32), M).reshape(-1, 2)
     center = p.mean(0)
@@ -181,8 +234,9 @@ def detect_car(frame, M):
     ang = (ang + CAR_ANGLE_OFFSET + 180) % 360 - 180    # 貼った向きの補正（-180〜180に）
     L = np.linalg.norm(top - center) * 1.5
     front = center + L * np.array([np.cos(np.radians(ang)), np.sin(np.radians(ang))])
-    return {"text": text, "x": int(center[0]), "y": int(center[1]),
-            "angle": round(ang, 1), "pts": p, "front": front}
+    return {"text": qr_state["text"], "x": int(center[0]), "y": int(center[1]),
+            "angle": round(ang, 1), "pts": p, "front": front, "raw_pts": pts,
+            "qr_px": round(qr_state["size"])}
 
 def loop():
     global latest_dets
@@ -190,11 +244,29 @@ def loop():
         cap = cv2.VideoCapture(CAM_ID, cv2.CAP_DSHOW)   # Windowsは起動が速いDirectShow
     else:
         cap = cv2.VideoCapture(CAM_ID)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))   # 高解像度でもコマ落ちしにくい形式
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_H)
     if not cap.isOpened():
         print("カメラが開けません。CAM_ID を 0/1/2 と変えて試してください")
         os._exit(1)
+    global raw_scale
+    ok, frame = cap.read()
+    while not ok:
+        time.sleep(0.1); ok, frame = cap.read()
+    fh, fw = frame.shape[:2]
+    print(f"カメラ解像度: {fw}x{fh}")
+    raw_scale = fw / RAW_VIEW_W
+    ow, oh = cfg.get("frame_size", [640, 480])      # 四隅を指定したときの解像度（旧設定は640x480）
+    if cfg["corners"] and (ow, oh) != (fw, fh):
+        if abs(ow / oh - fw / fh) < 0.03:            # 縦横比が同じ → 四隅を換算
+            cfg["corners"] = [[x * fw / ow, y * fh / oh] for x, y in cfg["corners"]]
+            print(f"四隅の座標を {ow}x{oh} → {fw}x{fh} に換算しました")
+        else:                                        # 縦横比が違う → 写る範囲が変わるので指定し直し
+            cfg["corners"] = []
+            print("解像度の縦横比が変わったので、ブラウザで四隅を指定し直してください")
+    cfg["frame_size"] = [fw, fh]
+    save()
     dst = np.float32([[0, 0], [BOARD_W, 0], [BOARD_W, BOARD_H], [0, BOARD_H]])
     font = cv2.FONT_HERSHEY_SIMPLEX
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -209,10 +281,11 @@ def loop():
         corners4 = list(cfg["corners"])
         chroma_min = cfg["chroma_min"]
 
-        raw = frame.copy()
+        raw = cv2.resize(frame, (RAW_VIEW_W, int(frame.shape[0] / raw_scale)))   # 表示用に縮小
         for i, (x, y) in enumerate(corners4):
-            cv2.circle(raw, (int(x), int(y)), 5, (0, 0, 255), -1)
-            cv2.putText(raw, str(i + 1), (int(x) + 6, int(y) - 6), font, 0.6, (0, 0, 255), 2)
+            x, y = int(x / raw_scale), int(y / raw_scale)
+            cv2.circle(raw, (x, y), 5, (0, 0, 255), -1)
+            cv2.putText(raw, str(i + 1), (x + 6, y - 6), font, 0.6, (0, 0, 255), 2)
 
         out = {"objects": [], "missing": [], "car": None}
         dets = []
@@ -267,12 +340,17 @@ def loop():
                             font, 0.5, (0, 0, 255), 2)
 
             # --- QRで車検出 ---
-            car = detect_car(frame, M)
+            car = detect_car(frame, M, corners4)
             now = time.time()
             if car:
                 last_car, last_car_t = car, now
             elif last_car and now - last_car_t < CAR_HOLD:
                 car = last_car
+            if qr_state["found"]:
+                cv2.polylines(raw, [(car["raw_pts"] / raw_scale).astype(np.int32)], True, (255, 0, 255), 2)
+                cv2.putText(vis, f"QR: OK ({car['qr_px']}px)", (8, 20), font, 0.6, (0, 255, 0), 2)
+            else:
+                cv2.putText(vis, "QR: NOT FOUND", (8, 20), font, 0.6, (0, 0, 255), 2)
             if car:
                 out["car"] = {k: car[k] for k in ("text", "x", "y", "angle")}
                 cv2.polylines(vis, [car["pts"].astype(np.int32)], True, (255, 0, 255), 2)
@@ -492,7 +570,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/click":
             if len(cfg["corners"]) >= 4:
                 cfg["corners"] = []
-            cfg["corners"] = cfg["corners"] + [[float(q["x"][0]), float(q["y"][0])]]
+            cfg["corners"] = cfg["corners"] + [[float(q["x"][0]) * raw_scale, float(q["y"][0]) * raw_scale]]
             save()
         elif u.path == "/reset":
             cfg["corners"] = []
