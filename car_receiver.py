@@ -4,11 +4,11 @@ car_receiver.py - ノートPC(board_vision.py)から座標を受け取る（ラ�
 
 使い方:  python3 car_receiver.py
 受信データ例:
-  {"objects": [{"id": "coneR", "color": "red", "x": 120, "y": 250,
+  {"objects": [{"id": "object5", "color": "red", "x": 120, "y": 250,
                 "crossed": true, "registered": true, "rgb": [196, 40, 32]}, ...],
    "missing": ["blockG"],
    "car": {"text": "car1", "x": 300, "y": 80, "angle": -90.0}, "t": 1731200000.1}
-  id:         ブラウザで登録した名前（未登録の物体は red1, blue2 ... と色+通し番号。見分けは registered で）
+  id:         ブラウザで登録した名前（未登録の物体は左から自動で object1, object2 ...）
   registered: 登録済みの物体なら true
   missing:    登録したのに今見えていない物体の名前
   color:      red / orange / yellow / green / blue
@@ -30,7 +30,7 @@ def stop_car():
 def control(data):
     """ここに車の制御を書く"""
     car = data.get("car")
-    objs = {o["id"]: o for o in data.get("objects", [])}   # objs["coneR"] のように名前で取り出せる
+    objs = {o["id"]: o for o in data.get("objects", [])}   # objs["object3"] のように名前で取り出せる
     targets = [o for o in objs.values() if o["crossed"]]
     if car is None:
         stop_car()          # 車(マーカー)が見えないときは止める

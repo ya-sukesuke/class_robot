@@ -87,10 +87,11 @@ def classify(rgb):
 
 class Tracker:
     """・登録した物体（名前つき）：同じ色の中で一番近いものに対応づけて追跡
-       ・未登録の物体：red1, red2 ... と自動で通し番号（登録名と重ならない番号）"""
+       ・未登録の物体：左から object1, object2 ... と自動で通し番号（登録名と重ならない番号）"""
     def __init__(self):
         self.pos = {}          # 登録物体の最後に見えた位置  name -> (x, y)
-        self.auto = {}         # 未登録物体  "red1" -> {"color", "no", "x", "y", "t"}
+        self.auto = {}         # 未登録物体  "object1" -> {"color", "no", "x", "y", "t"}
+        self.renumber_req = False
 
     @staticmethod
     def _greedy(pairs):
@@ -119,6 +120,8 @@ class Tracker:
 
         # 2) 未登録の物体：前フレームの近い同色物体の番号を引き継ぐ
         reg_names = {o["name"] for o in cfg["objects"]}
+        if self.renumber_req:          # 番号の振り直し → 今の位置で左から付け直す
+            self.auto, self.renumber_req = {}, False
         self.auto = {k: v for k, v in self.auto.items()
                      if now - v["t"] < TRACK_TIMEOUT and k not in reg_names}
         rest = [i for i in range(len(dets)) if i not in used_d]
@@ -132,20 +135,22 @@ class Tracker:
         for i, k in self._greedy(pairs):
             used_d.add(i)
             self._auto_set(dets[i], k, self.auto[k]["no"], now)
-        # 新しく現れた物体：左→右の順に、空いている一番小さい番号
+        # 新しく現れた物体：左→右の順に、空いている一番小さい番号（object1, object2 ...）
         for i in sorted([i for i in rest if i not in used_d], key=lambda i: (dets[i]["x"], dets[i]["y"])):
-            color = dets[i]["color"]
             taken = reg_names | set(self.auto)
             no = 1
-            while f"{color}{no}" in taken:
+            while f"object{no}" in taken:
                 no += 1
-            self._auto_set(dets[i], f"{color}{no}", no, now)
+            self._auto_set(dets[i], f"object{no}", no, now)
 
         names = [o["name"] for o in cfg["objects"]]
         missing = [n for n in names if n not in seen]
-        colors = list(DEFAULT_COLORS)
-        dets.sort(key=lambda d: (0, names.index(d["id"]), 0) if d["registered"]
-                  else (1, colors.index(d["color"]), self.auto[d["id"]]["no"]))
+        def order_key(d):              # object1, object2 ... の番号順。独自の名前は後ろに登録順
+            n = d["id"][6:] if d["id"].startswith("object") else ""
+            if n.isdigit():
+                return (0, int(n))
+            return (1, names.index(d["id"]) if d["registered"] else 0)
+        dets.sort(key=order_key)
         return dets, missing
 
     def _auto_set(self, d, key, no, now):
@@ -356,7 +361,8 @@ table{border-collapse:collapse} td,th{border:1px solid #ccc;padding:2px 8px}
 <button onclick="fetch('/reset')">四隅リセット</button></p>
 <img id=raw src=/stream/raw style="cursor:crosshair">
 <p>② 物体の名前付け：<b>物体を選ぶ → 色ボタンを押す → 名前を確認 → 「登録」</b>（全部の物体について繰り返す）<br>
-<small>何もしなくても red1, red2 … と自動で名前が付きます（映像では末尾に * ）。登録すると太枠になり名前が固定されます。選択中の物体は映像に白い丸が付きます。</small></p>
+<button onclick="fetch('/renumber')">番号を振り直す（今の位置で左から object1, 2, 3…）</button><br>
+<small>何もしなくても左から object1, object2 … と自動で名前が付きます（映像では末尾に * ）。登録すると太枠になり名前が固定されます。選択中の物体は映像に白い丸が付きます。</small></p>
 <img id=board src=/stream/board style="cursor:crosshair"> <img src=/stream/mask width=300>
 <div class=panel>
 <div>物体を選ぶ（映像の物体をクリック、または下のボタン）：</div>
@@ -391,15 +397,8 @@ function pos(img, e) {
 function setColor(c) {
   selColor = c;
   document.querySelectorAll('.cb').forEach(b => b.classList.toggle('on', b.dataset.c == c));
-  // 名前が自動の名前のままなら、色に合わせて付け直す
-  const n = $('objname').value;
-  if (!n || /^(red|orange|yellow|green|blue)[0-9]+$/.test(n)) $('objname').value = c + nextNo(c);
 }
 let lastObjs = [], regNames = [];
-function nextNo(c) {
-  const used = new Set([...lastObjs.map(o => o.id), ...regNames].filter(n => n != selId));
-  let i = 1; while (used.has(c + i)) i++; return i;
-}
 function showSel(d) {
   if (d.error) { $('msg').textContent = d.error; return; }
   selId = d.id;
@@ -514,6 +513,8 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/register":
             msg = register(q["id"][0], q["color"][0], q["name"][0])
             return self.reply(msg.encode())
+        elif u.path == "/renumber":
+            tracker.renumber_req = True
         elif u.path == "/delete":
             name = q["name"][0]
             with tlock:
