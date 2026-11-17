@@ -21,11 +21,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ===== 設定 =====
-PI_IP = "192.168.96.201"        # ← ラズパイのIPアドレスに変更（ssh で使っているもの）
+PI_IP = "192.168.96.201"      # ラズパイのIPアドレス
 PI_PORT = 5005                # car_receiver.py と合わせる
 SEND_HZ = 10                  # ラズパイへ送る頻度[回/秒]
-CAM_ID = 1                    # ノートPC内蔵カメラが0なら、USBカメラは1のことが多い
-CAP_W, CAP_H = 640, 480
+CAM_ID = 1                    # USBカメラ
+CAP_W, CAP_H = 640, 480       # QRが読めないときは 1280, 720 に上げると改善することがある
 BOARD_W, BOARD_H = 600, 400   # 補正後の盤面画像サイズ[px]。盤の実寸の縦横比に合わせる
 LINE_Y = 200                  # 補正後画像でこの y を超えた物体を「ライン越え」とする
 MIN_AREA = 150                # これより小さい色領域はノイズとして無視
@@ -53,16 +53,17 @@ if os.path.exists(CONF):
     cfg.update(json.load(open(CONF)))
     for k in ("rgb_lo", "rgb_hi"):            # 旧形式の設定は無視
         cfg.pop(k, None)
-cfg["objects"] = []   # 部屋の明るさで色が変わるので、物体は起動のたびにクリックで登録し直す（四隅としきい値は引き継ぐ）
 
 def save():
     json.dump(cfg, open(CONF, "w"), ensure_ascii=False, indent=1)
 
 qr = cv2.QRCodeDetector()
 lock = threading.Lock()
+tlock = threading.Lock()       # 追跡データ（tracker・登録）用
 jpgs = {"raw": None, "board": None, "mask": None}
 result = {}
 latest_dets = []              # クリック登録用（直近フレームの物体と輪郭）
+selected_id = None            # ブラウザで選択中の物体の名前（映像に白丸で表示）
 
 def order(pts):
     """4点を 左上, 右上, 右下, 左下 の順に並べる（クリック順は自由）"""
@@ -73,12 +74,8 @@ def order(pts):
 
 def classify(rgb):
     """平均RGBを一番近いお手本の色に分類。明るさの影響を減らすため r:g:b の比率で比べる。
-    お手本 = 登録した各物体の実測色 + まだ1つも登録していない色の初期値
-    （登録した色は初期値を使わない。初期値は別の部屋で測った値なので、今の明るさとずれるため）"""
-    objects = cfg["objects"]
-    reg_colors = {o["color"] for o in objects}
-    refs = [(c, v) for c, v in cfg["colors"].items() if c not in reg_colors] + \
-           [(o["color"], o["rgb"]) for o in objects]
+    お手本 = 初期の5色 + 登録した各物体の実測色"""
+    refs = list(cfg["colors"].items()) + [(o["color"], o["rgb"]) for o in cfg["objects"]]
     v = np.array(rgb, float); v = v / (v.sum() + 1e-6)
     best, bd = None, 1e9
     for name, ref in refs:
@@ -90,12 +87,10 @@ def classify(rgb):
 
 class Tracker:
     """・登録した物体（名前つき）：同じ色の中で一番近いものに対応づけて追跡
-         （最近まで見えていた物体は TRACK_DIST 以内の物体にだけ引き継ぐ。
-           盤から外れた直後に、遠くの同色の物体へ名前が飛ぶのを防ぐ）
        ・未登録の物体：red1, red2 ... と自動で通し番号（登録名と重ならない番号）"""
     def __init__(self):
-        self.pos = {}          # 登録物体の最後に見えた位置と時刻  name -> (x, y, t)
-        self.auto = {}         # 未登録物体  "red1" -> {"color", "x", "y", "t"}
+        self.pos = {}          # 登録物体の最後に見えた位置  name -> (x, y)
+        self.auto = {}         # 未登録物体  "red1" -> {"color", "no", "x", "y", "t"}
 
     @staticmethod
     def _greedy(pairs):
@@ -109,25 +104,21 @@ class Tracker:
 
     def update(self, dets):
         now = time.time()
-        objects = cfg["objects"]   # HTTP側はリストを丸ごと差し替えるので、1フレーム中はこの参照を使う
         # 1) 登録済みの物体
         pairs = []
-        for o in objects:
-            px, py, pt = self.pos.get(o["name"], (o["x"], o["y"], 0))
-            recent = now - pt < TRACK_TIMEOUT
-            for i, d in enumerate(dets):
+        for i, d in enumerate(dets):
+            for o in cfg["objects"]:
                 if o["color"] == d["color"]:
-                    dist = np.hypot(d["x"] - px, d["y"] - py)
-                    if not recent or dist < TRACK_DIST:
-                        pairs.append((dist, i, o["name"]))
+                    px, py = self.pos.get(o["name"], (o["x"], o["y"]))
+                    pairs.append((np.hypot(d["x"] - px, d["y"] - py), i, o["name"]))
         used_d, seen = set(), set()
         for i, name in self._greedy(pairs):
             used_d.add(i); seen.add(name)
             dets[i]["id"], dets[i]["registered"] = name, True
-            self.pos[name] = (dets[i]["x"], dets[i]["y"], now)
+            self.pos[name] = (dets[i]["x"], dets[i]["y"])
 
         # 2) 未登録の物体：前フレームの近い同色物体の番号を引き継ぐ
-        reg_names = {o["name"] for o in objects}
+        reg_names = {o["name"] for o in cfg["objects"]}
         self.auto = {k: v for k, v in self.auto.items()
                      if now - v["t"] < TRACK_TIMEOUT and k not in reg_names}
         rest = [i for i in range(len(dets)) if i not in used_d]
@@ -140,33 +131,30 @@ class Tracker:
                         pairs.append((dist, i, k))
         for i, k in self._greedy(pairs):
             used_d.add(i)
-            self._auto_set(dets[i], k, now)
+            self._auto_set(dets[i], k, self.auto[k]["no"], now)
         # 新しく現れた物体：左→右の順に、空いている一番小さい番号
-        taken = reg_names | set(self.auto)
         for i in sorted([i for i in rest if i not in used_d], key=lambda i: (dets[i]["x"], dets[i]["y"])):
             color = dets[i]["color"]
+            taken = reg_names | set(self.auto)
             no = 1
             while f"{color}{no}" in taken:
                 no += 1
-            taken.add(f"{color}{no}")
-            self._auto_set(dets[i], f"{color}{no}", now)
+            self._auto_set(dets[i], f"{color}{no}", no, now)
 
-        names = [o["name"] for o in objects]
+        names = [o["name"] for o in cfg["objects"]]
         missing = [n for n in names if n not in seen]
-        order_r = {n: i for i, n in enumerate(names)}
-        order_c = {c: i for i, c in enumerate(DEFAULT_COLORS)}   # 5色以外の色は後ろへ
-        dets.sort(key=lambda d: (0, order_r.get(d["id"], len(names)), "", 0) if d["registered"]
-                  else (1, order_c.get(d["color"], len(order_c)), d["color"], int(d["id"][len(d["color"]):])))
+        colors = list(DEFAULT_COLORS)
+        dets.sort(key=lambda d: (0, names.index(d["id"]), 0) if d["registered"]
+                  else (1, colors.index(d["color"]), self.auto[d["id"]]["no"]))
         return dets, missing
 
-    def _auto_set(self, d, key, now):
+    def _auto_set(self, d, key, no, now):
         d["id"], d["registered"] = key, False
-        self.auto[key] = {"color": d["color"], "x": d["x"], "y": d["y"], "t": now}
+        self.auto[key] = {"color": d["color"], "no": no, "x": d["x"], "y": d["y"], "t": now}
 
     def forget(self, name=None):
         if name is None:
             self.pos.clear()
-            self.auto.clear()
         else:
             self.pos.pop(name, None)
 
@@ -249,21 +237,26 @@ def loop():
                              "crossed": cy > LINE_Y, "rgb": rgb, "_cnt": c})
 
             # --- 登録した名前を付ける ---
-            dets, missing = tracker.update(dets)
+            with tlock:
+                dets, missing = tracker.update(dets)
             out["missing"] = missing
             for d in dets:
                 c = d["_cnt"]
                 cx, cy = d["x"], d["y"]
-                col = BGR_DRAW.get(d["color"], (255, 255, 255)) if d["registered"] else (150, 150, 150)
-                cv2.drawContours(vis, [c], -1, col, 3)
+                col = BGR_DRAW.get(d["color"], (255, 255, 255))
+                cv2.drawContours(vis, [c], -1, col, 3 if d["registered"] else 1)   # 登録済みは太枠
                 cv2.drawContours(vis, [c], -1, (255, 255, 255) if d["crossed"] else (0, 0, 0), 1)
                 cv2.circle(vis, (cx, cy), 4, (255, 255, 255), -1)
-                label = d["id"] if d["registered"] else f"{d['id']}?"
+                label = d["id"] if d["registered"] else d["id"] + "*"   # * = 未登録（自動の名前）
                 cv2.putText(vis, f"{label}{' !' if d['crossed'] else ''}", (cx + 6, cy - 4),
                             font, 0.55, (255, 255, 255), 2)
                 cv2.putText(vis, f"({cx},{cy})", (cx + 6, cy + 12), font, 0.4, (255, 255, 255), 1)
                 out["objects"].append({k: d[k] for k in
                                        ("id", "color", "x", "y", "crossed", "registered", "rgb")})
+            for d in dets:
+                if d["id"] == selected_id:
+                    cv2.circle(vis, (d["x"], d["y"]), 28, (255, 255, 255), 3)
+                    cv2.circle(vis, (d["x"], d["y"]), 31, (0, 0, 0), 1)
             if missing:
                 cv2.putText(vis, "missing: " + ", ".join(missing), (8, BOARD_H - 10),
                             font, 0.5, (0, 0, 255), 2)
@@ -306,95 +299,164 @@ def loop():
             print(out)
             last_print = time.time()
 
-def register(x, y, color, name):
-    """クリック位置の物体を、指定の色・名前で登録（同じ名前なら上書き）"""
+def find_hit(x, y):
+    """クリック位置の物体を返す（外していても 30px 以内なら一番近い物体）"""
     with lock:
         dets = list(latest_dets)
-    hit = None
-    for d in dets:                      # クリックした点を含む物体
+    for d in dets:
         if cv2.pointPolygonTest(d["_cnt"], (float(x), float(y)), False) >= 0:
-            hit = d
-            break
-    if hit is None and dets:            # 外していたら 30px 以内で一番近い物体
+            return d
+    if dets:
         d = min(dets, key=lambda d: np.hypot(d["x"] - x, d["y"] - y))
         if np.hypot(d["x"] - x, d["y"] - y) < 30:
-            hit = d
+            return d
+    return None
+
+def register(obj_id, color, name):
+    """選択中の物体（今の名前 obj_id）を、指定の色・名前で登録"""
+    global selected_id
+    if color not in DEFAULT_COLORS:
+        return "色を選んでください"
+    with lock:
+        hit = next((d for d in latest_dets if d["id"] == obj_id), None)
     if hit is None:
-        return "物体が見つかりません。物体の上をクリックしてください"
-    if name in tracker.auto and hit["id"] != name:
-        return f"{name} は別の未登録の物体が使っています。別の名前にしてください"
-    # 同じ名前、または同じ物体（すでに登録済み）の古い登録は消す
-    objs = [o for o in cfg["objects"]
-            if o["name"] != name and not (hit.get("registered") and o["name"] == hit["id"])]
+        return f"{obj_id} が今見えていません。もう一度物体を選び直してください"
+    with tlock:
+        _register(hit, color, name)
+    selected_id = name
+    return "ok"
+
+def _register(hit, color, name):
+    if hit["registered"]:
+        old = hit["id"]                    # 登録済みの物体の名前・色を変更
+    else:
+        old = None
+        tracker.auto.pop(hit["id"], None)  # 自動の名前は使わなくなる
+    objs = [o for o in cfg["objects"] if o["name"] not in (name, old)]
     for o in cfg["objects"]:
         if o not in objs:
             tracker.forget(o["name"])
     objs.append({"name": name, "color": color, "rgb": hit["rgb"], "x": hit["x"], "y": hit["y"]})
     cfg["objects"] = objs
-    tracker.pos[name] = (hit["x"], hit["y"], time.time())
+    tracker.pos[name] = (hit["x"], hit["y"])
     save()
     print(f"登録: {name} = {color}  RGB={hit['rgb']}  位置=({hit['x']},{hit['y']})")
-    return "ok"
 
 PAGE = """<!doctype html><meta charset=utf-8><title>Board Vision</title>
 <style>body{font-family:sans-serif;margin:12px} img{max-width:100%;border:1px solid #888;margin:2px}
 table{border-collapse:collapse} td,th{border:1px solid #ccc;padding:2px 8px}
-.sw{display:inline-block;width:14px;height:14px;vertical-align:middle;border:1px solid #888}</style>
+.sw{display:inline-block;width:14px;height:14px;vertical-align:middle;border:1px solid #888}
+.panel{background:#f3f3f3;padding:10px;margin:6px 0;border-radius:6px}
+.cb{color:#fff;border:3px solid transparent;border-radius:6px;padding:6px 12px;font-size:15px;cursor:pointer;margin:2px}
+.cb.on{border-color:#000;box-shadow:0 0 0 2px #fff inset}
+.db{margin:2px;padding:3px 8px;cursor:pointer;border:2px solid #999;border-radius:4px;background:#fff}
+.db.on{border-color:#000;font-weight:bold}</style>
 <h3>Board Vision</h3>
 <p>① RAW映像で盤の四隅を4回クリック（順番自由。5回目でやり直し）
 <button onclick="fetch('/reset')">四隅リセット</button></p>
 <img id=raw src=/stream/raw style="cursor:crosshair">
-<p>② 物体の登録：<b>色を選ぶ → 名前を確認 → 盤面の物体をクリック</b>（全部の物体について繰り返す）<br>
-色 <select id=color onchange="suggest()">
-<option>red</option><option>orange</option><option>yellow</option><option>green</option><option>blue</option></select>
-名前 <input id=name size=12>（半角英数字。画面の文字表示が日本語に対応していないため）
-<span id=msg style="color:#c00"></span></p>
+<p>② 物体の名前付け：<b>物体を選ぶ → 色ボタンを押す → 名前を確認 → 「登録」</b>（全部の物体について繰り返す）<br>
+<small>何もしなくても red1, red2 … と自動で名前が付きます（映像では末尾に * ）。登録すると太枠になり名前が固定されます。選択中の物体は映像に白い丸が付きます。</small></p>
 <img id=board src=/stream/board style="cursor:crosshair"> <img src=/stream/mask width=300>
+<div class=panel>
+<div>物体を選ぶ（映像の物体をクリック、または下のボタン）：</div>
+<div id=dets></div>
+<div style="margin-top:8px">選択中: <b id=sel>なし</b></div>
+<div style="margin-top:8px">色:
+<button class=cb data-c=red style="background:#d22">red</button>
+<button class=cb data-c=orange style="background:#e80">orange</button>
+<button class=cb data-c=yellow style="background:#db0;color:#000">yellow</button>
+<button class=cb data-c=green style="background:#080">green</button>
+<button class=cb data-c=blue style="background:#04c">blue</button></div>
+<div style="margin-top:8px">名前: <input id=objname size=14 placeholder="半角英数字">
+<button id=regbtn style="font-size:16px;padding:4px 16px">登録</button>
+<span id=msg style="color:#c00"></span></div>
+<small>名前は半角英数字（映像の文字表示が日本語に対応していないため）。Enterキーでも登録できます。</small>
+</div>
 <p>登録済みの物体 <button onclick="if(confirm('全部消しますか？'))fetch('/clear').then(load)">全部消す</button></p>
 <table id=tbl></table>
 <p>彩度しきい値 <input type=range id=cm min=10 max=200 oninput="setcm()"> <span id=cmv></span>
 （白線や影まで拾うなら上げる／物体が欠けるなら下げる）</p>
 <pre id=out></pre>
 <script>
-let objs = [];
+const $ = id => document.getElementById(id);
+let selId = null;       // 選択中の物体の今の名前
+let selColor = null;    // 選んだ色
+const COLORS = {red:'#d22', orange:'#e80', yellow:'#db0', green:'#080', blue:'#04c'};
 function pos(img, e) {
   const b = img.getBoundingClientRect();
   return [(e.clientX - b.left) * img.naturalWidth / b.width,
           (e.clientY - b.top) * img.naturalHeight / b.height];
 }
-raw.onclick = e => { const [x, y] = pos(raw, e); fetch(`/click?x=${x}&y=${y}`); };
-board.onclick = e => {
-  const [x, y] = pos(board, e);
-  const n = name.value.trim();
-  if (!/^[A-Za-z0-9_-]+$/.test(n)) { msg.textContent = '名前は半角英数字で入力してください'; return; }
-  fetch(`/register?x=${x}&y=${y}&color=${color.value}&name=${encodeURIComponent(n)}`)
-    .then(r => r.text()).then(t => { msg.textContent = t == 'ok' ? '' : t; load(); });
+function setColor(c) {
+  selColor = c;
+  document.querySelectorAll('.cb').forEach(b => b.classList.toggle('on', b.dataset.c == c));
+  // 名前が自動の名前のままなら、色に合わせて付け直す
+  const n = $('objname').value;
+  if (!n || /^(red|orange|yellow|green|blue)[0-9]+$/.test(n)) $('objname').value = c + nextNo(c);
+}
+let lastObjs = [], regNames = [];
+function nextNo(c) {
+  const used = new Set([...lastObjs.map(o => o.id), ...regNames].filter(n => n != selId));
+  let i = 1; while (used.has(c + i)) i++; return i;
+}
+function showSel(d) {
+  if (d.error) { $('msg').textContent = d.error; return; }
+  selId = d.id;
+  $('sel').textContent = `${d.id}${d.registered ? '（登録済み）' : '（未登録）'}  位置(${d.x},${d.y})`;
+  $('objname').value = d.id;
+  setColor(d.color);
+  $('msg').textContent = '';
+  drawDets();
+}
+document.querySelectorAll('.cb').forEach(b => b.onclick = () => setColor(b.dataset.c));
+$('raw').onclick = e => { const [x, y] = pos($('raw'), e); fetch(`/click?x=${x}&y=${y}`); };
+$('board').onclick = e => {
+  const [x, y] = pos($('board'), e);
+  fetch(`/select?x=${x}&y=${y}`).then(r => r.json()).then(showSel);
 };
-let autoIds = [];
-function suggest() {              // 次の空き番号を提案（red1, red2 ...）。未登録の物体が使っている番号も避ける
-  const used = new Set(objs.map(o => o.name).concat(autoIds));
-  let i = 1; while (used.has(color.value + i)) i++;
-  name.value = color.value + i;
+function pick(id) { fetch(`/select?id=${encodeURIComponent(id)}`).then(r => r.json()).then(showSel); }
+$('regbtn').onclick = doRegister;
+$('objname').onkeydown = e => { if (e.key == 'Enter') doRegister(); };
+function doRegister() {
+  if (!selId) { $('msg').textContent = '先に物体を選んでください'; return; }
+  if (!selColor) { $('msg').textContent = '色ボタンを押してください'; return; }
+  const n = $('objname').value.trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(n)) { $('msg').textContent = '名前は半角英数字で入力してください'; return; }
+  fetch(`/register?id=${encodeURIComponent(selId)}&color=${selColor}&name=${encodeURIComponent(n)}`)
+    .then(r => r.text()).then(t => {
+      if (t == 'ok') {
+        $('msg').textContent = '';
+        $('sel').textContent = `${n}（${selColor}）を登録しました。次の物体を選んでください`;
+        selId = n;
+      } else $('msg').textContent = t;
+      load();
+    });
+}
+function drawDets() {     // 今見えている物体のボタン一覧
+  $('dets').innerHTML = lastObjs.map(o =>
+    `<button class="db${o.id == selId ? ' on' : ''}" onclick="pick('${o.id}')">
+      <span class=sw style="background:${COLORS[o.color]}"></span> ${o.id}${o.registered ? '' : '*'}</button>`).join('')
+    || '（物体が見えていません。①で四隅を指定してください）';
 }
 function load() {
   fetch('/cfg').then(r => r.json()).then(c => {
-    objs = c.objects;
-    tbl.innerHTML = '<tr><th>名前</th><th>色</th><th>実測RGB</th><th>登録位置</th><th></th></tr>' +
-      objs.map(o => `<tr><td>${o.name}</td><td>${o.color}</td>
+    regNames = c.objects.map(o => o.name);
+    $('tbl').innerHTML = '<tr><th>名前</th><th>色</th><th>実測RGB</th><th>登録位置</th><th></th></tr>' +
+      c.objects.map(o => `<tr><td>${o.name}</td><td>${o.color}</td>
         <td><span class=sw style="background:rgb(${o.rgb})"></span> ${o.rgb}</td>
         <td>(${o.x},${o.y})</td>
         <td><button onclick="fetch('/delete?name=${o.name}').then(load)">削除</button></td></tr>`).join('');
-    cm.value = c.chroma_min; cmv.textContent = c.chroma_min;
-    suggest();
+    $('cm').value = c.chroma_min; $('cmv').textContent = c.chroma_min;
   });
 }
-function setcm() { cmv.textContent = cm.value; fetch('/chroma?v=' + cm.value); }
+function setcm() { $('cmv').textContent = $('cm').value; fetch('/chroma?v=' + $('cm').value); }
 load();
-setInterval(() => fetch('/result').then(r => r.json())
-  .then(j => {
-    out.textContent = JSON.stringify(j, null, 1);
-    autoIds = (j.objects || []).filter(o => !o.registered).map(o => o.id);
-  }), 500);
+setInterval(() => fetch('/result').then(r => r.json()).then(j => {
+  $('out').textContent = JSON.stringify(j, null, 1);
+  const key = j.objects.map(o => o.id + o.color + o.registered).join();
+  if (key != drawDets.key) { lastObjs = j.objects; drawDets.key = key; drawDets(); }
+}), 500);
 </script>"""
 
 class Handler(BaseHTTPRequestHandler):
@@ -404,6 +466,7 @@ class Handler(BaseHTTPRequestHandler):
     def reply(self, body, ctype="text/plain; charset=utf-8"):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -435,17 +498,32 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/reset":
             cfg["corners"] = []
             save()
+        elif u.path == "/select":
+            global selected_id
+            if "id" in q:                                   # 一覧のボタンから選択
+                with lock:
+                    d = next((d for d in latest_dets if d["id"] == q["id"][0]), None)
+            else:                                           # 映像のクリックで選択
+                d = find_hit(float(q["x"][0]), float(q["y"][0]))
+            if d is None:
+                body = {"error": "物体が見つかりません。物体の上をクリックしてください"}
+            else:
+                selected_id = d["id"]
+                body = {k: d[k] for k in ("id", "color", "x", "y", "registered")}
+            return self.reply(json.dumps(body).encode(), "application/json")
         elif u.path == "/register":
-            msg = register(float(q["x"][0]), float(q["y"][0]), q["color"][0], q["name"][0])
+            msg = register(q["id"][0], q["color"][0], q["name"][0])
             return self.reply(msg.encode())
         elif u.path == "/delete":
             name = q["name"][0]
-            cfg["objects"] = [o for o in cfg["objects"] if o["name"] != name]
-            tracker.forget(name)
+            with tlock:
+                cfg["objects"] = [o for o in cfg["objects"] if o["name"] != name]
+                tracker.forget(name)
             save()
         elif u.path == "/clear":
-            cfg["objects"] = []
-            tracker.forget()
+            with tlock:
+                cfg["objects"] = []
+                tracker.forget()
             save()
         elif u.path == "/chroma":
             cfg["chroma_min"] = int(q["v"][0])
