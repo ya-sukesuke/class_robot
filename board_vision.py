@@ -7,7 +7,7 @@ board_vision.py - 天井Webカメラで盤面を認識（ノートPCで実行）
   - 色の濃い領域（彩度が高い所）を物体として拾う
     （黒い盤・白線・ロープは彩度がほぼ0なので自動で除外される）
   - 物体を1個ずつクリックして「色」と「名前」を登録 → 以後その名前で追跡
-  - 車に貼った QRコード で車の位置と向きを検出
+  - 車に貼った ArUcoマーカー（または QRコード）で車の位置と向きを検出
   - 結果を UDP でラズパイ（car_receiver.py）へ送信
 
 使い方:  pip install opencv-python numpy
@@ -31,7 +31,8 @@ BOARD_W, BOARD_H = 600, 400   # 補正後の盤面画像サイズ[px]。盤の�
 LINE_Y = 200                  # 補正後画像でこの y を超えた物体を「ライン越え」とする
 MIN_AREA = 150                # これより小さい色領域はノイズとして無視
 CAR_HOLD = 0.3                # QRを一瞬見失っても、この秒数は直前の位置を保持
-CAR_ANGLE_OFFSET = 0          # QRの上辺が車のどちらを向いているか: 前=0, 左=90, 右=-90, 後ろ=180
+CAR_MARKER = "auto"           # 車の目印: "aruco"（推奨・小さくても読める） / "qr" / "auto"（両方探す）
+CAR_ANGLE_OFFSET = 0          # マーカー(QR)の上辺が車のどちらを向いているか: 前=0, 左=90, 右=-90, 後ろ=180
                               # （QRの中身は何でもOK。読んだ文字列は "text" として送るだけ）
 TRACK_DIST = 60               # 未登録の物体：前フレームからこの距離[px]以内なら同じ番号を引き継ぐ
 TRACK_TIMEOUT = 3.0           # 未登録の物体：見えなくなってもこの秒数は番号を保持
@@ -61,6 +62,15 @@ def save():
 qr = cv2.QRCodeDetector()
 QR_DETECTORS = ([cv2.QRCodeDetectorAruco()] if hasattr(cv2, "QRCodeDetectorAruco") else []) + [qr]
 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+# ArUco（OpenCV 4.7以降/以前の両方に対応）。印刷用マーカーは aruco_marker.pdf（DICT_4X4_50 の ID 0）
+_adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+if hasattr(cv2.aruco, "ArucoDetector"):
+    _adet = cv2.aruco.ArucoDetector(_adict, cv2.aruco.DetectorParameters())
+    detect_aruco = lambda g: _adet.detectMarkers(g)
+else:
+    _ap = cv2.aruco.DetectorParameters_create()
+    detect_aruco = lambda g: cv2.aruco.detectMarkers(g, _adict, parameters=_ap)
+latest_frame = None           # 画像保存ボタン用
 qr_state = {"c": None, "size": 0, "text": "", "text_t": 0, "found": False}   # 前回見つけたQR（カメラ画像の座標）
 raw_scale = 1.0               # カメラ画像 ÷ ブラウザ表示 の倍率（クリック座標の換算用）
 lock = threading.Lock()
@@ -170,6 +180,27 @@ class Tracker:
 
 tracker = Tracker()
 
+def _find_aruco(gray):
+    """ArUcoマーカーの4隅を探す（等倍→2倍に拡大）。戻り値: (4隅, ID) または None"""
+    for s in (1, 2):
+        g = gray if s == 1 else cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+        corners, ids, _ = detect_aruco(g)
+        if ids is not None and len(ids):
+            return np.asarray(corners[0]).reshape(4, 2) / s, int(np.asarray(ids).ravel()[0])
+    return None
+
+def _find_marker(gray):
+    """戻り値: (4隅, 種類, QRを見つけた画像, 倍率) または None"""
+    if CAR_MARKER in ("aruco", "auto"):
+        hit = _find_aruco(gray)
+        if hit:
+            return hit[0], f"aruco{hit[1]}", None, 1
+    if CAR_MARKER in ("qr", "auto"):
+        hit = _find_qr(gray)
+        if hit:
+            return hit[0], "qr", hit[1], hit[2]
+    return None
+
 def _find_qr(gray):
     """白黒画像からQRの4隅を探す。小さいQRのため、拡大・コントラスト強調・2種類の検出器を順に試す。
     戻り値: (4隅[元画像の座標], 見つけた画像, 倍率) または None"""
@@ -189,7 +220,7 @@ def _find_qr(gray):
     return None
 
 def detect_car(frame, M, corners):
-    """QRを元のカメラ画像（高解像度）で探し、盤面座標に変換する"""
+    """車のマーカー（ArUco/QR）を元のカメラ画像（高解像度）で探し、盤面座標に変換する"""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     H, W = gray.shape
     found = None
@@ -199,26 +230,28 @@ def detect_car(frame, M, corners):
         r = int(max(qr_state["size"] * 2.5, 80))
         x0, y0 = max(0, int(cx) - r), max(0, int(cy) - r)
         x1, y1 = min(W, int(cx) + r), min(H, int(cy) + r)
-        hit = _find_qr(gray[y0:y1, x0:x1])
+        hit = _find_marker(gray[y0:y1, x0:x1])
         if hit:
-            found = (hit[0] + [x0, y0], hit[1], hit[2], (x0, y0))
+            found = (hit[0] + [x0, y0], hit[1], hit[2], hit[3], (x0, y0))
     # 2) 見つからなければ盤の範囲全体を探す
     if found is None:
         c = np.array(corners)
         x0, y0 = np.maximum(c.min(0).astype(int) - 20, 0)
         x1, y1 = np.minimum(c.max(0).astype(int) + 20, [W, H])
-        hit = _find_qr(gray[y0:y1, x0:x1])
+        hit = _find_marker(gray[y0:y1, x0:x1])
         if hit:
-            found = (hit[0] + [x0, y0], hit[1], hit[2], (x0, y0))
+            found = (hit[0] + [x0, y0], hit[1], hit[2], hit[3], (x0, y0))
     if found is None:
         qr_state["c"], qr_state["found"] = None, False
         return None
-    pts, im, sc, (ox, oy) = found
+    pts, kind, im, sc, (ox, oy) = found
     qr_state["c"] = pts.mean(0)
     qr_state["size"] = float(np.linalg.norm(pts[0] - pts[2]) / 1.414)
     qr_state["found"] = True
     # 中身の文字列は1秒に1回だけ読む（位置と向きには不要で、読むのは重いため）
-    if time.time() - qr_state["text_t"] > 1.0:
+    if kind != "qr":
+        qr_state["text"] = kind                      # ArUco は "aruco0" のようにIDを入れる
+    elif time.time() - qr_state["text_t"] > 1.0:
         qr_state["text_t"] = time.time()
         try:
             t, _ = qr.decode(im, ((pts - [ox, oy]) * sc).astype(np.float32).reshape(1, 4, 2))
@@ -226,7 +259,7 @@ def detect_car(frame, M, corners):
                 qr_state["text"] = t
         except cv2.error:
             pass
-    # QRの4隅は QR自身の向きで 左上,右上,右下,左下 の順に返る
+    # 4隅は マーカー自身の向きで 左上,右上,右下,左下 の順に返る（ArUco・QRとも）
     p = cv2.perspectiveTransform(pts.reshape(-1, 1, 2).astype(np.float32), M).reshape(-1, 2)
     center = p.mean(0)
     top = (p[0] + p[1]) / 2             # QRの上辺の中点
@@ -236,10 +269,10 @@ def detect_car(frame, M, corners):
     front = center + L * np.array([np.cos(np.radians(ang)), np.sin(np.radians(ang))])
     return {"text": qr_state["text"], "x": int(center[0]), "y": int(center[1]),
             "angle": round(ang, 1), "pts": p, "front": front, "raw_pts": pts,
-            "qr_px": round(qr_state["size"])}
+            "qr_px": round(qr_state["size"]), "kind": kind}
 
 def loop():
-    global latest_dets
+    global latest_dets, latest_frame
     if sys.platform.startswith("win"):
         cap = cv2.VideoCapture(CAM_ID, cv2.CAP_DSHOW)   # Windowsは起動が速いDirectShow
     else:
@@ -340,7 +373,11 @@ def loop():
                             font, 0.5, (0, 0, 255), 2)
 
             # --- QRで車検出 ---
-            car = detect_car(frame, M, corners4)
+            try:
+                car = detect_car(frame, M, corners4)
+            except Exception as e:                 # 検出で予期しないエラーが出ても認識ループは止めない
+                print("車の検出でエラー:", e)
+                car, qr_state["found"] = None, False
             now = time.time()
             if car:
                 last_car, last_car_t = car, now
@@ -348,9 +385,9 @@ def loop():
                 car = last_car
             if qr_state["found"]:
                 cv2.polylines(raw, [(car["raw_pts"] / raw_scale).astype(np.int32)], True, (255, 0, 255), 2)
-                cv2.putText(vis, f"QR: OK ({car['qr_px']}px)", (8, 20), font, 0.6, (0, 255, 0), 2)
+                cv2.putText(vis, f"CAR: {car['kind']} OK ({car['qr_px']}px)", (8, 20), font, 0.6, (0, 255, 0), 2)
             else:
-                cv2.putText(vis, "QR: NOT FOUND", (8, 20), font, 0.6, (0, 0, 255), 2)
+                cv2.putText(vis, f"CAR: NOT FOUND ({CAR_MARKER})", (8, 20), font, 0.6, (0, 0, 255), 2)
             if car:
                 out["car"] = {k: car[k] for k in ("text", "x", "y", "angle")}
                 cv2.polylines(vis, [car["pts"].astype(np.int32)], True, (255, 0, 255), 2)
@@ -365,6 +402,7 @@ def loop():
                         font, 0.7, (255, 255, 255), 2)
 
         with lock:
+            latest_frame = frame
             latest_dets = dets
             jpgs["raw"] = cv2.imencode(".jpg", raw)[1].tobytes()
             jpgs["board"] = cv2.imencode(".jpg", vis)[1].tobytes()
@@ -436,7 +474,8 @@ table{border-collapse:collapse} td,th{border:1px solid #ccc;padding:2px 8px}
 .db.on{border-color:#000;font-weight:bold}</style>
 <h3>Board Vision</h3>
 <p>① RAW映像で盤の四隅を4回クリック（順番自由。5回目でやり直し）
-<button onclick="fetch('/reset')">四隅リセット</button></p>
+<button onclick="fetch('/reset')">四隅リセット</button>
+<button onclick="fetch('/snapshot').then(r=>r.text()).then(t=>alert(t))">カメラ画像を保存（原因調査用）</button></p>
 <img id=raw src=/stream/raw style="cursor:crosshair">
 <p>② 物体の名前付け：<b>物体を選ぶ → 色ボタンを押す → 名前を確認 → 「登録」</b>（全部の物体について繰り返す）<br>
 <button onclick="fetch('/renumber')">番号を振り直す（今の位置で左から object1, 2, 3…）</button><br>
@@ -572,6 +611,15 @@ class Handler(BaseHTTPRequestHandler):
                 cfg["corners"] = []
             cfg["corners"] = cfg["corners"] + [[float(q["x"][0]) * raw_scale, float(q["y"][0]) * raw_scale]]
             save()
+        elif u.path == "/snapshot":
+            with lock:
+                f = None if latest_frame is None else latest_frame.copy()
+            if f is None:
+                return self.reply("まだ画像がありません".encode())
+            fn = time.strftime("snapshot_%H%M%S.png")
+            cv2.imwrite(fn, f)
+            print("保存:", os.path.abspath(fn))
+            return self.reply(f"{os.path.abspath(fn)} に保存しました".encode())
         elif u.path == "/reset":
             cfg["corners"] = []
             save()
