@@ -5,21 +5,38 @@ main_haku.py - ロボット綱引き 自動制御「後引き」作戦（ラズ�
   → car_receiver.py で受け取る → このプログラムが車を動かす
 
   作戦：相手が綱を引いてブロックが相手側へ動いたら、取りに行って引き返す
-    （最初）  : 白線に沿って走り、横線に着いたらカメラの制御へ
-    STANDBY  : 待機位置で、ラインの方を向いて待つ。各ブロックの位置を見張る
+    （最初）  line_start（USE_LINE_START = True のとき）
+               1. 正面の物体へカメラでまっすぐ進む → つかむ → 中央の白線(HOME_LINE_Y)まで後退 → はなす
+               2. 白線の上で、相手に引かれた物体をカメラで見つける
+               3. 白線に沿ってライントレースで横へ動き、x 座標をレーンに合わせる
+               4. ラインの方を向き、ライントレース＋カメラで y 座標を合わせる → つかむ → 白線まで後退
+               （LINE_LOOP = True なら 2〜4 を競技終了までくり返す。False なら下のカメラ制御へ）
+    STANDBY  : ラインの方を向いて待つ。各ブロックの位置を見張る
                → ブロックが「一番自陣寄りにあった位置」から PULLED_DIST 以上
                  相手側へ動いたら「相手に引かれた」と判断
-    APPROACH : そのブロックの自陣側（真後ろ）に回り込み、ラインの方を向いて近づく
-    GRAB     : つかむ → 後退して自陣側へ引く → はなして下がる → STANDBY に戻る
+    APPROACH : MOVE  … カメラで、ブロックの白線（レーン）の自陣側の点へ移動
+               FACE  … その場でラインの方を向く（少しずつ回して行き過ぎを防ぐ）
+               LINE  … ライントレースでブロックへ一直線に進む
+    GRAB     : つかむ → 後退して自陣側へ引く → はなして下がる → その場で STANDBY
+               （後退中は カメラの向き＋ラインセンサ で真っすぐ下がる）
     2分（MATCH_TIME）たったら全停止
 
+  ※ ブロックは「ラインに垂直な白線（レーン）」の上にある前提。
+    レーンの x 座標が分かっていれば LANE_XS に書く（空ならブロックの x を使う）
+
 使い方
+  python3 main_haku.py          自動制御
+  python3 main_haku.py sensor   ラインセンサの値を表示するだけ（まずこれで確認！）
+  python3 main_haku.py line     ライントレースだけを LINE_TEST_TIME 秒試す（ゲイン調整用）
+  python3 main_haku.py back     後退だけを LINE_TEST_TIME 秒試す（カメラ必要）
+
   1. ノートPC で board_vision.py を起動し、四隅の指定とブロックの登録をしておく
-     （登録すると名前が固定され、ブロックの取り違えが起きにくい）
-  2. ラズパイで  python3 main_haku.py
-     最初は DRY_RUN = True で、モーターを回さずに表示だけ確認するのがおすすめ
+  2. sensor モードで「白線の上 = ■」「左右の順番」が正しいか確かめる
+  3. line モードでライントレースがフラフラしないか確かめる
+  4. 最初は DRY_RUN = True で、モーターを回さずに表示だけ確認するのがおすすめ
 """
 import math
+import sys
 import time
 
 import base             # モーター（import 時に reset_mcu() される。サーボより先に import すること）
@@ -36,6 +53,8 @@ LINE_Y = 200                  # 中央のライン（board_vision.py の LINE_Y�
 OUR_SIDE = "top"              # 自陣が補正後の盤面画像の 上(y < LINE_Y) なら "top"、下なら "bottom"
 SAFE_MARGIN = 30              # 盤の端からこの距離[px]より外へは進まない（外周壁に当てない）
 LINE_MARGIN = 10              # 車の先端はラインからこの距離[px]より相手側へ出さない（反則防止）
+LANE_XS = []                  # ブロックが乗っている白線（レーン）の x 座標[px]。例: [150, 300, 450]
+                              # 空なら、ブロックの x をそのままレーンとして使う
 
 # --- 相手に引かれたかの判断 ---
 PULLED_DIST = 25        # 一番自陣寄りにあった位置から、これ以上[px]相手側へ動いたら「引かれた」
@@ -43,50 +62,70 @@ BLOCK_LINE_MARGIN = 20  # ラインからこの距離[px]以内のブロック�
 COOLDOWN = 3.0          # 引き返した後、同じブロックをこの秒数は狙わない
 SKIP_NAMES = []         # 狙わないブロックの名前（例: ["object3"]）
 
-# --- 待機位置 ---
-STANDBY_X = BOARD_W // 2                 # 待機する場所[px]（自陣の真ん中あたり）
+# --- 最初の待機位置 ---
+STANDBY_X = BOARD_W // 2                 # 最初に待機する場所[px]（自陣の真ん中あたり）
 STANDBY_DEPTH = 90                       # ラインから自陣側へこの距離[px]の所で待つ
 STANDBY_TOL = 30                         # 待機位置からこの距離[px]以内なら「着いた」
 
-# --- 走行 ---
+# --- カメラで走る（レーンの手前まで移動するとき）---
 FWD_SPEED = 40          # 前進の基本速度[%]
 TURN_SPEED = 35         # その場旋回の速度[%]
-KP = 0.8                # 向きのずれ[度] → 左右の速度差[%] の比例ゲイン
+KP = 0.5                # 向きのずれ[度] → 左右の速度差[%]（大きいとフラフラする）
+HEAD_DEADBAND = 4       # 向きのずれがこれ以下[度]なら補正しない（カメラの揺れで蛇行しないように）
 TURN_IN_PLACE_DEG = 30  # 向きのずれがこれより大きければ、その場で旋回してから進む
+SPIN_SLOW_DEG = 35      # ずれがこれ以下[度]なら、旋回を「少し回して止まる」をくり返す（行き過ぎ防止）
+SPIN_PULSE = 0.06       # 少しずつ回すときの1回の回転時間[秒]
+FACE_TOL = 6            # ラインの方を向いたとみなす向きのずれ[度]
 TURN_SIGN = 1           # 目標と逆向きに曲がっていく場合は -1 にする
 
 # --- 回り込み・つかむ ---
-STAGE_DIST = 110        # ブロックの自陣側、この距離[px]の点にまず回り込む
-SIDE_TOL = 40           # ブロックとの横のずれがこれ以下なら「真後ろにいる」
+STAGE_DIST = 110        # ブロックの自陣側、この距離[px]のレーン上の点にまず移動する
+STAGE_TOL = 15          # その点からこの距離[px]以内なら「着いた」
+LANE_TOL = 40           # ライントレース中、車がレーンから横にこれ以上[px]ずれたら移動し直す
 GRAB_DIST = 60          # 車の中心（QRの中心）とブロックの距離[px]がこれ以下でつかむ
-GRAB_ALIGN_DEG = 15     # つかむときに許す向きのずれ[度]
 FRONT_OFFSET = 40       # 車の中心から先端（後端）までの距離[px]
 SERVO_PIN = "P0"
 SERVO_OPEN = -60        # 開いた角度[度]（servo_sweep.py で確かめた値に変える）
 SERVO_CLOSE = 30        # 閉じた角度[度]
 SERVO_WAIT = 0.6        # サーボが動き終わるまで待つ時間[秒]
 
-# --- 引き返す ---
-PULL_SPEED = 45         # 後退して引く速度[%]
+# --- 引き返す（後退）---
+PULL_SPEED = 40         # 後退して引く速度[%]
 PULL_DIST = 80          # つかんだ位置からこの距離[px]自陣側へ引いたら終わり
 PULL_TIME = 3.0         # ブロックが見えなくても、この秒数で引くのをやめる
-BACK_OFF_TIME = 0.5     # はなした後に下がる時間[秒]
+BACK_OFF_TIME = 0.6     # はなした後に下がる時間[秒]
+KP_BACK = 0.6           # 後退中、向きのずれ[度] → 左右の速度差[%]（後退はこれが主役）
+LINE_BACK_KP = 2        # 後退中のラインセンサの補正（0 にすると使わない。大きくすると不安定になる）
 
-# --- スタート直後のライントレース ---
-USE_LINE_START = True   # True: 最初は白線に沿って走り、その後カメラの制御に切り替える
-LINE_SPEED = 35         # ライントレースの速度[%]
-LINE_STOP_AT_CROSS = True   # 横線（交差点）に着いたらカメラの制御に切り替える
-LINE_IGNORE_TIME = 0.5  # スタート直後この秒数は横線の判定をしない
-LINE_MAX_TIME = 5.0     # 横線が見つからなくても、この秒数でカメラの制御に切り替える
+# --- スタート直後（line_start）---
+#   1. 正面の物体へカメラでまっすぐ進む → つかむ → 中央の白線まで後退 → はなす
+#   2. 相手に引かれた物体をカメラで見つける
+#   3. 中央の白線に沿ってライントレースで横へ動き、x 座標を合わせる
+#   4. ラインの方を向き、ライントレース＋カメラで y 座標を合わせる → つかむ → 白線まで後退
+USE_LINE_START = True   # True: 上の流れで動く（False なら最初からカメラだけの制御）
+HOME_LINE_Y = 100       # 自陣の「中央の白線」（中央ライン LINE_Y と平行な横線）の y[px]。実際の値に変える
+LINE_LOOP = True        # True: 2〜4 を競技終了までくり返す / False: 1回やったらカメラだけの制御へ
+START_SPEED = 40        # 正面の物体へ進む速度[%]
+FRONT_CONE_DEG = 25     # 車の正面からこの角度[度]以内にある物体を「正面の物体」とする
+START_FIND_TIME = 2.0   # 正面の物体をこの秒数探しても見つからなければ、つかむのを飛ばす
+START_GO_TIME = 5.0     # 正面の物体へ進むのにこの秒数かかったら諦める
+BACK_LINE_TIME = 5.0    # 中央の白線まで後退する最大時間[秒]
+LINE_SPEED = 35         # 中央の白線に沿って横へ動く速度[%]
+X_TOL = 10              # レーンの x とのずれがこれ以下[px]なら「x が合った」
+X_SLOW_DIST = 40        # レーンまでこの距離[px]以内になったら MIN_SPEED に落とす（行き過ぎ防止）
+ALIGN_TIME = 6.0        # x 合わせ・y 合わせのそれぞれ、この秒数で諦める
+TURN_TIMEOUT = 4.0      # その場旋回でこの秒数たっても向けなければ諦める
 
 # --- ラインセンサ ---
-LINE_PINS = [17, 27, 22, 4]   # GPIO番号を「左から順」に（D0～D3 = GPIO17, 4, 27, 22）
-WHITE_VALUE = 0         # 白線の上でセンサが出す値（白=0・黒=1 と逆なら 1 にする）
+LINE_PINS = [17, 27, 22, 4]   # GPIO番号を「左から順」に（sensor モードで確認する）
+WHITE_VALUE = 0         # 白線の上でセンサが出す値（sensor モードで白線の上が □ なら 1 にする）
 LINE_WEIGHTS = [-3, -1, 1, 3]  # 各センサの位置（左が −、右が +）
-LINE_KP = 12            # 線のずれ → 左右の速度差[%]
-LINE_SEARCH_SPEED = 30  # 線を見失ったときに旋回して探す速度[%]
-CROSS_COUNT = 3         # 白のセンサがこの個数以上なら「横線（交差点）」
+LINE_KP = 6             # 線のずれ → 左右の速度差[%]（フラフラするなら下げる、曲がり切れないなら上げる）
+LINE_APPROACH_SPEED = 32    # ブロックへライントレースで近づく速度[%]
+LINE_LOST_TIME = 0.3    # 線を見失ってもこの秒数は直前の曲がり方を続ける。過ぎたらカメラの向きで直進
+CROSS_COUNT = 3         # 白のセンサがこの個数以上なら「横線（交差点）」→ 真っすぐ進む
 MIN_SPEED = 25          # これより遅いとTTモーターが回らない[%]
+LINE_TEST_TIME = 4.0    # line / back モードで走る時間[秒]
 
 # --- その他 ---
 MATCH_TIME = 120        # 競技時間[秒]。これを過ぎたら止まる
@@ -104,44 +143,19 @@ servo = None if DRY_RUN else Servo(SERVO_PIN)
 
 def drive_lr(left, right):
     """左右のモーターを別々の速さで回す（+:前進, -:後退, 単位[%]）
-    base.py の M1 = 左, M2 = 右（base.py の「右回転 = (1, -1)」より）"""
+    base.py の M1 = 左, M2 = 右（base.py の「右回転 = (1, -1)」より）
+    MIN_SPEED 未満の値は、半分未満なら 0、それ以上なら MIN_SPEED にする
+    （小さい値を全部 MIN_SPEED に上げると左右差がなくなり、曲がれなくなるため）"""
     if DRY_RUN:
         return
     for pwm, dir_pin, sign, v in ((base.m1_pwm, base.m1_dir, base.M1_SIGN, left),
                                   (base.m2_pwm, base.m2_dir, base.M2_SIGN, right)):
         v = max(-100, min(100, v))
-        if abs(v) < 1:
+        if abs(v) < MIN_SPEED * 0.5:
             base.set_motor(pwm, dir_pin, 0, 0)
         else:
             d = 1 if v > 0 else -1
             base.set_motor(pwm, dir_pin, d * sign, max(abs(v), MIN_SPEED))
-
-
-# ---------------- ラインセンサ ----------------
-# active_state=True を付けないと「floating, but active_state is not defined」エラーになる
-line_sensors = [Pin(p, Pin.IN, active_state=True) for p in LINE_PINS]
-_last_side = 0          # 最後に線が見えた側（-1:左, +1:右）
-
-
-def line_read():
-    """[左, 左中, 右中, 右]  白=1, 黒=0"""
-    return [1 if s.value() == WHITE_VALUE else 0 for s in line_sensors]
-
-
-def line_is_cross(w):
-    return sum(w) >= CROSS_COUNT
-
-
-def line_speed(w, base_speed):
-    """線のずれに比例して左右の速度を決める（線が右 → 右へ曲がる）"""
-    global _last_side
-    if sum(w) == 0:                       # 見失った → 最後に見えた側へその場旋回
-        s = LINE_SEARCH_SPEED if _last_side >= 0 else -LINE_SEARCH_SPEED
-        return s, -s
-    pos = sum(k * v for k, v in zip(LINE_WEIGHTS, w)) / sum(w)
-    if pos != 0:
-        _last_side = 1 if pos > 0 else -1
-    return base_speed + LINE_KP * pos, base_speed - LINE_KP * pos
 
 
 def stop():
@@ -155,6 +169,15 @@ def spin(err):
     drive_lr(t, -t)
 
 
+def turn_step(err):
+    """向きを合わせる1回分。ずれが小さいときは「少し回して止める」
+    （カメラの遅れで回りすぎるのを防ぐ。止まっている間に次の位置が届く）"""
+    spin(err)
+    if abs(err) <= SPIN_SLOW_DEG:
+        time.sleep(SPIN_PULSE)
+        stop()
+
+
 def gripper(close):
     if DRY_RUN:
         print("  [サーボ]", "閉じる" if close else "開く")
@@ -163,22 +186,94 @@ def gripper(close):
     time.sleep(SERVO_WAIT)
 
 
-def line_start():
-    """スタート直後：白線に沿って走り、横線に着いたら（または時間切れで）止まる"""
-    print("ライントレースでスタート")
-    t0 = time.time()
-    while time.time() - t0 < LINE_MAX_TIME:
+def clamp(v, lim):
+    return max(-lim, min(lim, v))
+
+
+# ---------------- ラインセンサ ----------------
+# active_state=True を付けないと「floating, but active_state is not defined」エラーになる
+line_sensors = [Pin(p, Pin.IN, active_state=True) for p in LINE_PINS]
+
+
+def line_read():
+    """[左, 左中, 右中, 右]  白=1, 黒=0"""
+    return [1 if s.value() == WHITE_VALUE else 0 for s in line_sensors]
+
+
+class LineFollower:
+    """ラインセンサで線に沿って走る。見失ったときはカメラの向きで真っすぐ進む"""
+
+    def __init__(self):
+        self.last_pos = 0.0     # 最後に見えた線のずれ（左 −, 右 +）
+        self.t_seen = 0.0       # 最後に線が見えた時刻
+        self.cross = False      # 今、横線の上か
+
+    def reset(self):
+        self.last_pos, self.t_seen = 0.0, time.time()
+
+    def read(self):
+        """線のずれを返す。見えなければ None"""
         w = line_read()
-        # スタート地点の線を横線と間違えないよう、最初の LINE_IGNORE_TIME 秒は判定しない
-        if LINE_STOP_AT_CROSS and time.time() - t0 > LINE_IGNORE_TIME and line_is_cross(w):
-            print("横線に到着")
-            break
-        left, right = line_speed(w, LINE_SPEED)
-        drive_lr(left, right)
-        time.sleep(0.02)
-    else:
-        print("ライントレース時間切れ")
-    stop()
+        n = sum(w)
+        self.cross = n >= CROSS_COUNT
+        if n == 0:
+            return None
+        if self.cross:                      # 横線 → ずれ 0 として真っすぐ
+            pos = 0.0
+        else:
+            pos = sum(k * v for k, v in zip(LINE_WEIGHTS, w)) / n
+        self.last_pos, self.t_seen = pos, time.time()
+        return pos
+
+    def forward(self, speed, cam_err=None):
+        """前進しながら線に沿う。cam_err はカメラで見た目標へのずれ[度]（無ければ None）
+        戻り値: 状態の説明"""
+        pos = self.read()
+        if pos is not None:
+            st = f"ライン ずれ{pos:+.1f}"
+        elif time.time() - self.t_seen < LINE_LOST_TIME or cam_err is None:
+            pos = self.last_pos             # 一瞬の見失い → 直前の曲がり方を続ける
+            st = "ライン見失い（直前の向きで）"
+        else:                               # しばらく見えない → カメラの向きで直進
+            e = 0 if abs(cam_err) < HEAD_DEADBAND else cam_err
+            diff = clamp(KP * e, speed)
+            drive_lr(speed + diff, speed - diff)
+            return f"ラインなし→カメラで直進 ずれ{cam_err:+.0f}°"
+        # 内側の車輪は「止まる」まで。逆回転はさせない（その場旋回するとフラフラするため）
+        diff = clamp(LINE_KP * pos, speed)
+        drive_lr(speed + diff, speed - diff)
+        return st
+
+    def backward(self, speed, head_err=None):
+        """後退しながら真っすぐ下がる。head_err は「ラインの方を向く角度」とのずれ[度]
+        ※ センサは車の前側にあるので、後退中に線だけで曲がると不安定になる。
+          カメラの向きを主に使い、線は弱く（前進と逆向きに）補正する。"""
+        pos = self.read()
+        diff = 0.0
+        if head_err is not None:
+            diff = KP_BACK * (0 if abs(head_err) < HEAD_DEADBAND else head_err)
+            if pos is not None:
+                diff -= LINE_BACK_KP * pos
+        diff = clamp(diff, speed * 0.6)
+        drive_lr(-speed + diff, -speed - diff)
+
+
+lf = LineFollower()
+
+
+# ---------------- 競技時間 ----------------
+t_end = None            # この時刻を過ぎたら止まる（start_clock() で決まる）
+
+
+def start_clock():
+    global t_end
+    if t_end is None:
+        t_end = time.time() + MATCH_TIME
+        print("スタート")
+
+
+def time_up():
+    return t_end is not None and time.time() > t_end
 
 
 # ---------------- 位置の計算 ----------------
@@ -192,6 +287,11 @@ def aim(car, x, y):
     dx, dy = x - car["x"], y - car["y"]
     bearing = math.degrees(math.atan2(dy, dx))       # 画面座標（右=0, 下=+90）
     return math.hypot(dx, dy), wrap180(bearing - car["angle"]) * TURN_SIGN
+
+
+def face_err(car):
+    """ラインの方を向く角度とのずれ[度]（+ なら右へ回る）"""
+    return wrap180(FACE_LINE_ANGLE - car["angle"]) * TURN_SIGN
 
 
 def point_ahead(car, d):
@@ -226,16 +326,23 @@ def clamp_point(x, y):
     return x, y
 
 
+def lane_of(x):
+    """ブロックの x に一番近いレーンの x（LANE_XS が空ならそのまま）"""
+    return min(LANE_XS, key=lambda lx: abs(lx - x)) if LANE_XS else x
+
+
 def steer_to(car, x, y):
-    """点(x, y) へ向かう。戻り値は (距離, ずれ, 動作の説明)"""
+    """点(x, y) へカメラを見ながら向かう。戻り値は (距離, ずれ, 動作の説明)
+    ※ 着いたかどうかは呼ぶ側で判定する（近すぎると方向がブレて蛇行するため）"""
     dist, err = aim(car, x, y)
     if abs(err) > TURN_IN_PLACE_DEG:
-        spin(err)
+        turn_step(err)
         return dist, err, "旋回"
     if not safe_ahead(car):
         stop()
         return dist, err, "前方が壁/ラインに近い"
-    diff = KP * err                       # ずれに比例して左右の速さを変える
+    e = 0 if abs(err) < HEAD_DEADBAND else err
+    diff = clamp(KP * e, FWD_SPEED)         # ずれに比例して左右の速さを変える
     drive_lr(FWD_SPEED + diff, FWD_SPEED - diff)
     return dist, err, "前進"
 
@@ -269,29 +376,258 @@ class Watcher:
         return sorted(res, key=self.loss, reverse=True)
 
 
+watch = Watcher()
+
+
+def sense():
+    """最新の (車, 物体) を取り、ブロックの見張りも更新する"""
+    car, objs = car_receiver.get_location()
+    watch.update(objs)
+    return car, objs
+
+
 # ---------------- つかむ → 引き返す ----------------
+def back_straight(duration, stop_fn=None):
+    """カメラの向き＋ラインセンサで真っすぐ後退する。stop_fn(car, objs) が True で止める"""
+    t0 = time.time()
+    while time.time() - t0 < duration and not time_up():
+        c, objs = sense()
+        if c is not None and not in_board(*point_ahead(c, -FRONT_OFFSET)):
+            print("  後ろが壁に近いので止まる")
+            break
+        if stop_fn is not None and stop_fn(c, objs):
+            break
+        lf.backward(PULL_SPEED, face_err(c) if c is not None else None)
+        time.sleep(LOOP_DT)
+    stop()
+
+
 def grab_and_pull(target, grab_y):
     print(f"{target} をつかむ")
     gripper(True)
-    print("引き返す")
-    t0 = time.time()
-    while time.time() - t0 < PULL_TIME:
-        c, objs = car_receiver.get_location()
-        if c is not None and not in_board(*point_ahead(c, -FRONT_OFFSET)):
-            print("  後ろが壁に近いので引くのをやめる")
-            break
+    print("引き返す（真っすぐ後退）")
+
+    def pulled_enough(c, objs):
         o = objs.get(target)
         if o is not None and (grab_y - o["y"]) * OPP >= PULL_DIST:
             print(f"  {PULL_DIST}px 引き返した")
-            break
-        drive_lr(-PULL_SPEED, -PULL_SPEED)
-        time.sleep(LOOP_DT)
-    stop()
+            return True
+        return False
+
+    back_straight(PULL_TIME, pulled_enough)
     print("はなす")
     gripper(False)
-    drive_lr(-FWD_SPEED, -FWD_SPEED)
-    time.sleep(BACK_OFF_TIME)
+    back_straight(BACK_OFF_TIME)            # はなした後も真っすぐ下がる（次のブロックへ動きやすく）
+
+
+# ---------------- スタート直後：中央の白線を使う作戦 ----------------
+def at_home_line(c):
+    """車の中心が中央の白線（HOME_LINE_Y）まで下がったか"""
+    return (c["y"] - HOME_LINE_Y) * OPP <= 0
+
+
+def back_to_line(target=None):
+    """中央の白線まで真っすぐ後退する。target を持っていれば白線ではなす"""
+    print("中央の白線まで後退")
+
+    def reached(c, objs):
+        if c is None:
+            return lf.cross             # カメラが無いときはラインセンサの横線で止める
+        return at_home_line(c)
+
+    back_straight(BACK_LINE_TIME, reached)
+    if target is not None:
+        print("はなす")
+        gripper(False)
+        watch.cool[target] = time.time() + COOLDOWN
+
+
+def turn_to(ang):
+    """その場で角度 ang[度]（右=0, 下=+90, 上=-90, 左=180）を向く。向けたら True"""
+    t0 = time.time()
+    while time.time() - t0 < TURN_TIMEOUT and not time_up():
+        car, _ = sense()
+        if car is None:
+            stop()
+        else:
+            e = wrap180(ang - car["angle"]) * TURN_SIGN
+            if abs(e) <= FACE_TOL:
+                stop()
+                return True
+            turn_step(e)
+        time.sleep(LOOP_DT)
     stop()
+    print(f"  {ang}° を向けなかった")
+    return False
+
+
+def track(target, t_lost):
+    """target を取り出す。見失って LOST_TIME 過ぎた／相手コートに入ったら "lost" を返す"""
+    _, objs = car_receiver.get_location()
+    obj = objs.get(target)
+    if obj is None:
+        return ("lost" if time.time() - t_lost > LOST_TIME else None), t_lost
+    if not our_side(obj["y"], 0):
+        return "lost", t_lost
+    return obj, time.time()
+
+
+def grab_front():
+    """1. 正面の物体へカメラでまっすぐ進み、つかんで中央の白線まで後退する"""
+    print("正面の物体を探す")
+    target, t0 = None, time.time()
+    while target is None and time.time() - t0 < START_FIND_TIME:
+        car, objs = sense()
+        if car is not None:
+            cand = []
+            for o in objs.values():
+                d, e = aim(car, o["x"], o["y"])
+                if abs(e) <= FRONT_CONE_DEG and o["id"] not in SKIP_NAMES and our_side(o["y"], 0):
+                    cand.append((d, o["id"]))
+            if cand:
+                target = min(cand)[1]           # 正面にある中で一番近いもの
+        time.sleep(LOOP_DT)
+    if target is None:
+        print("正面に物体が見つからない → 中央の白線へ")
+        back_to_line()
+        return
+
+    print(f"正面の {target} へまっすぐ進む")
+    t0 = t_lost = time.time()
+    while not time_up():
+        if time.time() - t0 > START_GO_TIME:
+            print("  時間切れ")
+            break
+        car, _ = sense()
+        obj, t_lost = track(target, t_lost)
+        if obj == "lost":
+            print(f"  {target} を見失った")
+            break
+        if car is None or obj is None:
+            stop()
+            time.sleep(LOOP_DT)
+            continue
+        d, e = aim(car, obj["x"], obj["y"])
+        if d <= GRAB_DIST or (not safe_ahead(car) and d <= GRAB_DIST + 20):
+            stop()
+            gripper(True)
+            print(f"{target} をつかんだ")
+            back_to_line(target)
+            return
+        if not safe_ahead(car):
+            print("  前方がラインに近く届かない")
+            break
+        e = 0 if abs(e) < HEAD_DEADBAND else e
+        diff = clamp(KP * e, START_SPEED)
+        drive_lr(START_SPEED + diff, START_SPEED - diff)
+        time.sleep(LOOP_DT)
+    stop()
+    back_to_line()
+
+
+def wait_pulled():
+    """2. 中央の白線の上で、相手に引かれた物体が出るまで待つ。物体の名前を返す（時間切れなら None）"""
+    print("相手に引かれた物体を見張り中")
+    turn_to(FACE_LINE_ANGLE)
+    while not time_up():
+        _, objs = sense()
+        pulled = watch.pulled(objs, time.time())
+        if pulled:
+            o = pulled[0]
+            print(f"{o['id']} が {watch.loss(o):.0f}px 引かれた → 取り返しに行く")
+            return o["id"]
+        time.sleep(LOOP_DT)
+    return None
+
+
+def align_x(target):
+    """3. 中央の白線に沿ってライントレースし、ブロックのレーンの x に合わせる"""
+    car, objs = sense()
+    obj = objs.get(target)
+    if car is None or obj is None:
+        return False
+    lane = lane_of(obj["x"])
+    if abs(lane - car["x"]) <= X_TOL:
+        return True
+    ang = 0 if lane > car["x"] else 180             # 右へ行くなら 0°、左なら 180°
+    sgn = 1 if ang == 0 else -1
+    print(f"x 合わせ: x={car['x']:.0f} → レーン x={lane:.0f}")
+    if not turn_to(ang):
+        return False
+    lf.reset()
+    t0 = t_lost = time.time()
+    while not time_up() and time.time() - t0 < ALIGN_TIME:
+        car, _ = sense()
+        obj, t_lost = track(target, t_lost)
+        if obj == "lost":
+            break
+        if car is None:
+            stop()
+            time.sleep(LOOP_DT)
+            continue
+        if obj is not None:
+            lane = lane_of(obj["x"])
+        rest = (lane - car["x"]) * sgn                  # レーンまでの残り[px]（− なら行き過ぎ）
+        if rest <= X_TOL:
+            stop()
+            print("  x が合った")
+            return True
+        if not safe_ahead(car):
+            print("  前方が壁に近い")
+            break
+        speed = LINE_SPEED if rest > X_SLOW_DIST else MIN_SPEED
+        lf.forward(speed, cam_err=wrap180(ang - car["angle"]) * TURN_SIGN)
+        time.sleep(LOOP_DT)
+    stop()
+    print("  x 合わせ失敗")
+    return False
+
+
+def align_y(target):
+    """4. ラインの方を向き、レーンをライントレース＋カメラで進んで y を合わせ、つかむ"""
+    print("y 合わせ: レーンをブロックへ進む")
+    if not turn_to(FACE_LINE_ANGLE):
+        return False
+    lf.reset()
+    t0 = t_lost = time.time()
+    while not time_up() and time.time() - t0 < ALIGN_TIME:
+        car, _ = sense()
+        obj, t_lost = track(target, t_lost)
+        if obj == "lost":
+            break
+        if car is None or obj is None:
+            stop()
+            time.sleep(LOOP_DT)
+            continue
+        d, e = aim(car, obj["x"], obj["y"])
+        if d <= GRAB_DIST or (not safe_ahead(car) and d <= GRAB_DIST + 20):
+            stop()
+            gripper(True)
+            print(f"{target} をつかんだ")
+            back_to_line(target)
+            return True
+        if not safe_ahead(car):
+            print("  前方がラインに近く届かない")
+            break
+        lf.forward(LINE_APPROACH_SPEED, cam_err=e)     # 線に沿う。見失ったらカメラで直進
+        time.sleep(LOOP_DT)
+    stop()
+    print("  y 合わせ失敗")
+    return False
+
+
+def line_start():
+    """スタート直後の作戦。正面の物体を引く → 引かれた物体を中央の白線を使って取り返す"""
+    grab_front()
+    while not time_up():
+        target = wait_pulled()
+        if target is None:
+            return
+        if not (align_x(target) and align_y(target)):
+            watch.cool[target] = time.time() + COOLDOWN     # 失敗したらしばらく狙わない
+            back_to_line()
+        if not LINE_LOOP:
+            return
 
 
 # ---------------- メイン（状態遷移） ----------------
@@ -299,31 +635,31 @@ def main():
     car_receiver.start()
     gripper(False)                      # 最初は開いておく
 
-    t_start = None                      # 2分を数え始める時刻
     if USE_LINE_START:
-        t_start = time.time()           # ライントレースで動き出した時点からスタート
+        start_clock()                   # 動き出した時点から2分を数える
         line_start()
 
     print("カメラの制御に切り替え（データが来なければ board_vision.py を確認）")
-    watch = Watcher()
-    state, target, final = "STANDBY", None, False
+    state, phase, target, lane = "STANDBY", "", None, 0
     standby = clamp_point(STANDBY_X, LINE_Y - OPP * STANDBY_DEPTH)
+    if USE_LINE_START:
+        c, _ = car_receiver.get_location()
+        if c is not None:
+            standby = clamp_point(c["x"], c["y"])   # 今いる場所で待つ
     t_lost = time.time()
     last_print = 0
 
     while True:
-        car, objs = car_receiver.get_location()
+        car, objs = sense()
         now = time.time()
 
-        if car is not None and t_start is None:
-            t_start = now
-            print("スタート")
-        if t_start is not None and now - t_start > MATCH_TIME:
+        if car is not None:
+            start_clock()
+        if time_up():
             stop()
             print("競技時間終了。停止します")
             return
 
-        watch.update(objs)
         msg = ""
 
         # ---- 車が見えない／通信が切れた → その場で止まる ----
@@ -331,67 +667,95 @@ def main():
             stop()
             msg = "車が見えません（QR・通信を確認）"
 
-        # ---- 待機：引かれたブロックが出るまで待機位置で待つ ----
+        # ---- 待機：引かれたブロックが出るまで待つ ----
         elif state == "STANDBY":
             pulled = watch.pulled(objs, now)
             if pulled:
-                target, final, t_lost = pulled[0]["id"], False, now
-                state = "APPROACH"
+                o = pulled[0]
+                target, lane, t_lost = o["id"], lane_of(o["x"]), now
+                state, phase = "APPROACH", "MOVE"
                 stop()
-                msg = f"{target} が {watch.loss(pulled[0]):.0f}px 引かれた → 取り返しに行く"
+                msg = f"{target} が {watch.loss(o):.0f}px 引かれた → レーン x={lane:.0f} から取り返しに行く"
             else:
-                dist, err = aim(car, *standby)
+                dist, _ = aim(car, *standby)
                 if dist > STANDBY_TOL:
                     _, _, act = steer_to(car, *standby)
                     msg = f"待機位置へ（残り {dist:.0f}px）{act}"
                 else:
-                    face = wrap180(FACE_LINE_ANGLE - car["angle"]) * TURN_SIGN
-                    if abs(face) > 20:
-                        spin(face)                  # ラインの方を向く
+                    fe = face_err(car)
+                    if abs(fe) > FACE_TOL * 2:
+                        turn_step(fe)               # ラインの方を向く
                         msg = "待機：向きを合わせる"
                     else:
                         stop()
                         msg = "待機中（相手が引くのを見張り中）"
 
-        # ---- ブロックの真後ろに回り込んでから近づく ----
+        # ---- レーンの手前へ移動 → ラインの方を向く → ライントレースで一直線 ----
         elif state == "APPROACH":
             obj = objs.get(target)
             if obj is None or not our_side(obj["y"], 0):     # ラインを越えたら諦める
                 stop()
                 if obj is not None or now - t_lost > LOST_TIME:
                     state = "STANDBY"               # 見失った／相手コートに入った → 諦めて待機
+                    standby = clamp_point(car["x"], car["y"])
                 msg = f"{target} を見失い中"
             else:
                 t_lost = now
+                dist_b, err_b = aim(car, obj["x"], obj["y"])
                 behind = (car["y"] - obj["y"]) * OPP     # − なら車がブロックより自陣側
-                if not final and behind <= -STAGE_DIST * 0.6 and abs(car["x"] - obj["x"]) <= SIDE_TOL:
-                    final = True                    # 真後ろに着いた → ブロックへ向かう
-                if final and behind > 0:
-                    final = False                   # ブロックを追い越した → 回り込み直し
+                if phase != "MOVE" and (behind > 0 or abs(car["x"] - lane) > LANE_TOL):
+                    phase = "MOVE"                  # 追い越した／レーンから外れた → 移動し直す
 
-                if not final:
-                    sx, sy = clamp_point(obj["x"], obj["y"] - OPP * STAGE_DIST)
-                    dist, err, act = steer_to(car, sx, sy)
-                    msg = f"{target} の後ろへ回り込み（残り {dist:.0f}px）{act}"
-                else:
-                    dist, err = aim(car, obj["x"], obj["y"])
-                    if dist <= GRAB_DIST and abs(err) <= GRAB_ALIGN_DEG:
+                if phase == "MOVE":
+                    sx, sy = clamp_point(lane, obj["y"] - OPP * STAGE_DIST)
+                    d, _ = aim(car, sx, sy)
+                    if d <= STAGE_TOL:
+                        stop()
+                        phase = "FACE"
+                        msg = "レーンの手前に到着"
+                    else:
+                        _, _, act = steer_to(car, sx, sy)
+                        msg = f"レーンの手前へ（残り {d:.0f}px）{act}"
+
+                elif phase == "FACE":
+                    fe = face_err(car)
+                    if abs(fe) <= FACE_TOL:
+                        stop()
+                        lf.reset()
+                        phase = "LINE"
+                        msg = "ラインの方を向いた → ライントレース開始"
+                    else:
+                        turn_step(fe)
+                        msg = f"ラインの方へ回転 ずれ{fe:+.0f}°"
+
+                elif phase == "LINE":
+                    if dist_b <= GRAB_DIST:
                         stop()
                         state = "GRAB"
-                    elif dist <= GRAB_DIST:
-                        spin(err)
-                        msg = "向きを合わせる"
+                        msg = "ブロックに到着"
+                    elif not safe_ahead(car):
+                        stop()
+                        if dist_b <= GRAB_DIST + 20:
+                            state = "GRAB"
+                            msg = "前方がラインに近いのでここでつかむ"
+                        else:
+                            watch.cool[target] = now + COOLDOWN
+                            state = "STANDBY"
+                            standby = clamp_point(car["x"], car["y"])
+                            msg = "前方がラインに近く届かない → 諦める"
                     else:
-                        _, _, act = steer_to(car, obj["x"], obj["y"])
-                        msg = act
-                    msg = f"{target}: 距離 {dist:.0f}px ずれ {err:+.0f}° {msg}"
+                        msg = lf.forward(LINE_APPROACH_SPEED, cam_err=err_b)
+                msg = f"<{phase}> {target}: 距離 {dist_b:.0f}px  {msg}"
 
-        # ---- つかむ → 引き返す → はなす ----
+        # ---- つかむ → 引き返す → はなす → その場で待機 ----
         elif state == "GRAB":
             obj = objs.get(target)
             grab_y = obj["y"] if obj else car["y"]
             grab_and_pull(target, grab_y)
             watch.cool[target] = time.time() + COOLDOWN
+            c, _ = car_receiver.get_location()
+            c = c or car
+            standby = clamp_point(c["x"], c["y"])   # 下がった場所で次を待つ（次のレーンへ近い）
             state = "STANDBY"
 
         if msg and now - last_print > 0.5:
@@ -400,9 +764,46 @@ def main():
         time.sleep(LOOP_DT)
 
 
+# ---------------- 確認用モード ----------------
+def sensor_check():
+    """ラインセンサの値を表示するだけ。白線の上で ■ になるか、左右の順番が合っているか確かめる"""
+    print("白線の上 = ■ になるか確認。逆なら WHITE_VALUE を変える")
+    print("車を右へずらすと、■ が左へ動けば順番OK。逆なら LINE_PINS の順を逆にする")
+    while True:
+        raw = [s.value() for s in line_sensors]
+        w = line_read()
+        pos = lf.read()
+        p = "なし" if pos is None else f"{pos:+.1f}"
+        print("左→右:", " ".join("■" if v else "□" for v in w), f"  生の値 {raw}  ずれ {p}")
+        time.sleep(0.2)
+
+
+def line_test():
+    """ライントレースだけを試す（カメラ不要）"""
+    print(f"{LINE_TEST_TIME}秒 ライントレースします（速度 {LINE_APPROACH_SPEED}, LINE_KP {LINE_KP}）")
+    lf.reset()
+    t0 = last = time.time()
+    while time.time() - t0 < LINE_TEST_TIME:
+        st = lf.forward(LINE_APPROACH_SPEED)
+        if time.time() - last > 0.2:
+            print(" ", st)
+            last = time.time()
+        time.sleep(0.02)
+    stop()
+
+
+def back_test():
+    """後退だけを試す（カメラ必要）。ラインの方を向けて置いてから実行する"""
+    car_receiver.start()
+    time.sleep(1)
+    print(f"{LINE_TEST_TIME}秒 真っすぐ後退します")
+    back_straight(LINE_TEST_TIME)
+
+
 if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
     try:
-        main()
+        {"auto": main, "sensor": sensor_check, "line": line_test, "back": back_test}[mode]()
     except KeyboardInterrupt:
         print("\n中断されました。")
     finally:
