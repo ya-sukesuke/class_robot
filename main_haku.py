@@ -7,11 +7,11 @@ main_haku.py - ロボット綱引き 自動制御「後引き」作戦（ラズ�
   作戦：相手が綱を引いてブロックが相手側へ動いたら、取りに行って引き返す
     （最初）  line_start（USE_LINE_START = True のとき）
                1. 最初の物体（緑）へカメラで進む → car_pos_obj で止まる → サーボでつかむ
-                  → 18cm 後退して引く（途中で止まったらOK）→ はなす → 中央の白線(HOME_LINE_Y)まで後退
+                  → 中央の白線(HOME_LINE_Y)まで後退して引く（途中で止まったらOK）→ はなす
                2. 白線の上で、相手に引かれた物体をカメラで見つける
                3. 90度回って、白線に沿ってライントレースで進み、x 座標を物体に合わせる
                4. 90度回って、ライントレース＋カメラで car_pos_obj まで進む → つかむ
-                  → 18cm 引く → はなす → 中央の白線まで後退 → 2 に戻る
+                  → 白線まで引く → はなす → 2 に戻る
                ※ car_pos_obj = 物体の y − 腕の長さ（ARM_LEN_CM）
                （LINE_LOOP = True なら 2〜4 を競技終了までくり返す。False なら下のカメラ制御へ）
     STANDBY  : ラインの方を向いて待つ。各ブロックの位置を見張る
@@ -91,7 +91,10 @@ ARM_LEN_CM = 15         # 車の中心（QRの中心）から腕（つかむ所�
 ARM_LEN = ARM_LEN_CM * PX_PER_CM
 #   car_pos_obj = 物体の y − 腕の長さ（自陣側へ）。車の中心の y がここに来たらつかむ
 GRAB_TOL = 5            # car_pos_obj までの残りがこれ以下[px]で止まってつかむ
-GRAB_SLOW_DIST = 30     # car_pos_obj までこの距離[px]以内になったら MIN_SPEED に落とす（行き過ぎ防止）
+GRAB_SLOW_DIST = 60     # car_pos_obj までこの距離[px]以内になったら、近づくほど MIN_SPEED へ減速する
+FINE_TRIES = 6          # 止まった後の「ちょい前進／ちょい後退」で位置を合わせる最大回数
+FINE_PULSE = 0.08       # ちょい動かす1回の時間[秒]
+FINE_SETTLE = 0.25      # 止まってから、カメラの位置が落ち着くまで待つ時間[秒]
 FRONT_OFFSET = 40       # 車の中心から先端（後端）までの距離[px]
 SERVO_PIN = "P0"
 SERVO_OPEN = -60        # 開いた角度[度]（servo_sweep.py で確かめた値に変える）
@@ -100,8 +103,7 @@ SERVO_WAIT = 0.6        # サーボが動き終わるまで待つ時間[秒]
 
 # --- 引き返す（後退）---
 PULL_SPEED = 40         # 後退して引く速度[%]
-PULL_CM = 18            # つかんだ位置からこの距離[cm]後退して引いたら、はなす
-PULL_TIME = 5.0         # 18cm に届かなくても、この秒数で引くのをやめる
+PULL_TIME = 6.0         # 白線に着かなくても、この秒数で引くのをやめる
 STALL_TIME = 0.8        # 引いている途中、この秒数ほとんど動かなければ「止まった → OK」として、はなす
 STALL_PX = 3            # この距離[px]以下しか動いていなければ「止まっている」とみなす
 BACK_OFF_TIME = 0.6     # はなした後に下がる時間[秒]
@@ -110,11 +112,11 @@ LINE_BACK_KP = 2        # 後退中のラインセンサの補正（0 にする�
 
 # --- スタート直後（line_start）---
 #   1. 最初の物体（START_COLOR）へカメラで進む → car_pos_obj で止まる → つかむ
-#      → 18cm 後退して引く → はなす → 中央の白線まで後退
+#      → 中央の白線まで後退して引く → はなす
 #   2. 相手に引かれた物体をカメラで見つける
 #   3. 90度回って、中央の白線に沿ってライントレースで進み、x 座標を物体に合わせる
 #   4. 90度回って、ライントレース＋カメラで car_pos_obj まで進む → つかむ
-#      → 18cm 後退して引く → はなす → 中央の白線まで後退  → 2 に戻る
+#      → 中央の白線まで後退して引く → はなす → 2 に戻る
 USE_LINE_START = True   # True: 上の流れで動く（False なら最初からカメラだけの制御）
 START_COLOR = "green"   # 最初に引く物体の色（見つからなければ正面の一番近い物体）
 HOME_LINE_Y = 100       # 自陣の「中央の白線」（中央ライン LINE_Y と平行な横線）の y[px]。実際の値に変える
@@ -423,28 +425,47 @@ def back_straight(duration, stop_fn=None):
     stop()
 
 
+def fine_adjust(target):
+    """止まった後、カメラが落ち着くのを待ってから、ちょい前進／ちょい後退で car_pos_obj に合わせる
+    （走りながらだとカメラの遅れで行き過ぎたり手前で止まったりするため）"""
+    for _ in range(FINE_TRIES):
+        time.sleep(FINE_SETTLE)
+        car, objs = sense()
+        obj = objs.get(target)
+        if car is None or obj is None:
+            return
+        rest = grab_rest(car, obj)
+        if abs(rest) <= GRAB_TOL:
+            return
+        if rest > 0 and not safe_ahead(car):
+            return
+        s = MIN_SPEED if rest > 0 else -MIN_SPEED
+        drive_lr(s, s)
+        time.sleep(FINE_PULSE)
+        stop()
+
+
 def pull_and_release(target):
-    """サーボでつかむ → 真っすぐ後退して PULL_CM 引く（途中で止まったらそこでOK）→ はなす"""
+    """サーボでつかむ → 中央の白線まで真っすぐ後退して引く（途中で止まったらそこでOK）→ はなす"""
     print(f"{target} をつかむ")
     gripper(True)
-    print(f"{PULL_CM}cm 引く（真っすぐ後退）")
-    pull_px = PULL_CM * PX_PER_CM
-    st = {"y0": None, "x": None, "y": None, "t": time.time()}
+    print("中央の白線まで引く（真っすぐ後退）")
+    st = {"x": None, "y": None, "t": time.time()}
+    c0, _ = sense()
+    # つかんだ時点で白線より後ろなら、白線では止めない（止まるか時間切れまで引く）
+    use_line = c0 is None or not at_home_line(c0)
 
     def pulled_enough(c, objs):
         if c is None:
-            return False
+            return use_line and lf.cross    # カメラが無いときはラインセンサの横線で止める
         now = time.time()
-        if st["y0"] is None:
-            st.update(y0=c["y"], x=c["x"], y=c["y"], t=now)
-        if (st["y0"] - c["y"]) * OPP >= pull_px:
-            print(f"  {PULL_CM}cm 引いた")
+        if use_line and at_home_line(c):
+            print("  白線まで引いた")
             return True
-        if math.hypot(c["x"] - st["x"], c["y"] - st["y"]) > STALL_PX:
+        if st["x"] is None or math.hypot(c["x"] - st["x"], c["y"] - st["y"]) > STALL_PX:
             st.update(x=c["x"], y=c["y"], t=now)        # 動いている
         elif now - st["t"] > STALL_TIME:
-            moved = (st["y0"] - c["y"]) * OPP / PX_PER_CM
-            print(f"  {moved:.0f}cm で止まった → OK")
+            print("  途中で止まった → OK")
             return True
         return False
 
@@ -460,8 +481,8 @@ def at_home_line(c):
     return (c["y"] - HOME_LINE_Y) * OPP <= 0
 
 
-def back_to_line():
-    """中央の白線まで真っすぐ後退する（下がりすぎていたら前進して戻る）"""
+def back_to_line(fix_overshoot=True):
+    """中央の白線まで真っすぐ後退する（fix_overshoot=True なら、下がりすぎていたら前進して戻る）"""
     print("中央の白線まで後退")
 
     def reached(c, objs):
@@ -470,8 +491,10 @@ def back_to_line():
         return at_home_line(c)
 
     back_straight(BACK_LINE_TIME, reached)
+    if not fix_overshoot:
+        return
 
-    # 引いた結果、白線より後ろにいたら前進して白線に戻る
+    # 白線より後ろにいたら前進して白線に戻る
     t0 = time.time()
     while not time_up() and time.time() - t0 < BACK_LINE_TIME:
         c, _ = sense()
@@ -490,14 +513,19 @@ def reach_and_pull(target, car, obj, e, line):
     rest = grab_rest(car, obj)
     if rest <= GRAB_TOL or (not safe_ahead(car) and rest <= GRAB_TOL + 20):
         stop()
-        print(f"  car_pos_obj に到着（残り {rest:.0f}px）")
+        print(f"  car_pos_obj に到着（残り {rest:.0f}px）→ 位置を微調整")
+        fine_adjust(target)
         pull_and_release(target)
-        back_to_line()
+        # 途中で止まったときだけ白線まで下がる（はなした物体を押さないよう前進はしない）
+        back_to_line(fix_overshoot=False)
         return "done"
     if not safe_ahead(car):
         print("  前方がラインに近く届かない")
         return "fail"
-    speed = (LINE_APPROACH_SPEED if line else START_SPEED) if rest > GRAB_SLOW_DIST else MIN_SPEED
+    # 遠いうちは基本速度、GRAB_SLOW_DIST 以内は近づくほど MIN_SPEED へなめらかに減速
+    base_speed = LINE_APPROACH_SPEED if line else START_SPEED
+    k = min(1.0, max(0.0, rest / GRAB_SLOW_DIST))
+    speed = MIN_SPEED + (base_speed - MIN_SPEED) * k
     if line:
         lf.forward(speed, cam_err=e)            # 線に沿う。見失ったらカメラで直進
     elif abs(e) > TURN_IN_PLACE_DEG:
@@ -810,6 +838,7 @@ def main():
 
         # ---- つかむ → 引き返す → はなす → その場で待機 ----
         elif state == "GRAB":
+            fine_adjust(target)
             pull_and_release(target)
             back_straight(BACK_OFF_TIME)    # はなした後も真っすぐ下がる（次のブロックへ動きやすく）
             c, _ = car_receiver.get_location()
