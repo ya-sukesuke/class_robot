@@ -1,11 +1,11 @@
 """
-main.py - ロボット綱引き 自動制御「後引き」作戦（ラズパイで実行）
+main_haku.py - ロボット綱引き 自動制御「後引き」作戦（ラズパイで実行）
 
   ノートPC の board_vision.py が天井カメラで「車の位置・向き」と「ブロックの位置」を送る
   → car_receiver.py で受け取る → このプログラムが車を動かす
 
   作戦：相手が綱を引いてブロックが相手側へ動いたら、取りに行って引き返す
-    （最初）  : 白線に沿って走り、横線に着いたらカメラの制御へ（linetrace.py）
+    （最初）  : 白線に沿って走り、横線に着いたらカメラの制御へ
     STANDBY  : 待機位置で、ラインの方を向いて待つ。各ブロックの位置を見張る
                → ブロックが「一番自陣寄りにあった位置」から PULLED_DIST 以上
                  相手側へ動いたら「相手に引かれた」と判断
@@ -16,7 +16,7 @@ main.py - ロボット綱引き 自動制御「後引き」作戦（ラズパイ
 使い方
   1. ノートPC で board_vision.py を起動し、四隅の指定とブロックの登録をしておく
      （登録すると名前が固定され、ブロックの取り違えが起きにくい）
-  2. ラズパイで  python3 main.py
+  2. ラズパイで  python3 main_haku.py
      最初は DRY_RUN = True で、モーターを回さずに表示だけ確認するのがおすすめ
 """
 import math
@@ -24,8 +24,8 @@ import time
 
 import base             # モーター（import 時に reset_mcu() される。サーボより先に import すること）
 import car_receiver
-import linetrace        # ラインセンサ（reset_mcu() はしないので順番は気にしなくてよい）
-from robot_hat import Servo
+from robot_hat import Pin, Servo
+# ※ linetrace.py は使わない（ラインセンサの処理はこのファイルの中にある）
 
 # ===================== 設定 =====================
 DRY_RUN = False         # True: モーター・サーボを動かさず、判断の結果だけ表示する
@@ -79,6 +79,15 @@ LINE_STOP_AT_CROSS = True   # 横線（交差点）に着いたらカメラの�
 LINE_IGNORE_TIME = 0.5  # スタート直後この秒数は横線の判定をしない
 LINE_MAX_TIME = 5.0     # 横線が見つからなくても、この秒数でカメラの制御に切り替える
 
+# --- ラインセンサ ---
+LINE_PINS = [17, 27, 22, 4]   # GPIO番号を「左から順」に（D0～D3 = GPIO17, 4, 27, 22）
+WHITE_VALUE = 0         # 白線の上でセンサが出す値（白=0・黒=1 と逆なら 1 にする）
+LINE_WEIGHTS = [-3, -1, 1, 3]  # 各センサの位置（左が −、右が +）
+LINE_KP = 12            # 線のずれ → 左右の速度差[%]
+LINE_SEARCH_SPEED = 30  # 線を見失ったときに旋回して探す速度[%]
+CROSS_COUNT = 3         # 白のセンサがこの個数以上なら「横線（交差点）」
+MIN_SPEED = 25          # これより遅いとTTモーターが回らない[%]
+
 # --- その他 ---
 MATCH_TIME = 120        # 競技時間[秒]。これを過ぎたら止まる
 LOST_TIME = 1.0         # 狙ったブロックがこの秒数見えなければ、待機に戻る
@@ -94,9 +103,45 @@ servo = None if DRY_RUN else Servo(SERVO_PIN)
 
 
 def drive_lr(left, right):
-    """左右のモーターを別々の速さで回す（+:前進, -:後退, 単位[%]）"""
-    if not DRY_RUN:
-        base.drive_lr(left, right)
+    """左右のモーターを別々の速さで回す（+:前進, -:後退, 単位[%]）
+    base.py の M1 = 左, M2 = 右（base.py の「右回転 = (1, -1)」より）"""
+    if DRY_RUN:
+        return
+    for pwm, dir_pin, sign, v in ((base.m1_pwm, base.m1_dir, base.M1_SIGN, left),
+                                  (base.m2_pwm, base.m2_dir, base.M2_SIGN, right)):
+        v = max(-100, min(100, v))
+        if abs(v) < 1:
+            base.set_motor(pwm, dir_pin, 0, 0)
+        else:
+            d = 1 if v > 0 else -1
+            base.set_motor(pwm, dir_pin, d * sign, max(abs(v), MIN_SPEED))
+
+
+# ---------------- ラインセンサ ----------------
+# active_state=True を付けないと「floating, but active_state is not defined」エラーになる
+line_sensors = [Pin(p, Pin.IN, active_state=True) for p in LINE_PINS]
+_last_side = 0          # 最後に線が見えた側（-1:左, +1:右）
+
+
+def line_read():
+    """[左, 左中, 右中, 右]  白=1, 黒=0"""
+    return [1 if s.value() == WHITE_VALUE else 0 for s in line_sensors]
+
+
+def line_is_cross(w):
+    return sum(w) >= CROSS_COUNT
+
+
+def line_speed(w, base_speed):
+    """線のずれに比例して左右の速度を決める（線が右 → 右へ曲がる）"""
+    global _last_side
+    if sum(w) == 0:                       # 見失った → 最後に見えた側へその場旋回
+        s = LINE_SEARCH_SPEED if _last_side >= 0 else -LINE_SEARCH_SPEED
+        return s, -s
+    pos = sum(k * v for k, v in zip(LINE_WEIGHTS, w)) / sum(w)
+    if pos != 0:
+        _last_side = 1 if pos > 0 else -1
+    return base_speed + LINE_KP * pos, base_speed - LINE_KP * pos
 
 
 def stop():
@@ -123,12 +168,12 @@ def line_start():
     print("ライントレースでスタート")
     t0 = time.time()
     while time.time() - t0 < LINE_MAX_TIME:
-        w = linetrace.read()
+        w = line_read()
         # スタート地点の線を横線と間違えないよう、最初の LINE_IGNORE_TIME 秒は判定しない
-        if LINE_STOP_AT_CROSS and time.time() - t0 > LINE_IGNORE_TIME and linetrace.is_cross(w):
+        if LINE_STOP_AT_CROSS and time.time() - t0 > LINE_IGNORE_TIME and line_is_cross(w):
             print("横線に到着")
             break
-        left, right = linetrace.trace_speed(w, base=LINE_SPEED)
+        left, right = line_speed(w, LINE_SPEED)
         drive_lr(left, right)
         time.sleep(0.02)
     else:

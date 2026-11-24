@@ -19,3 +19,4 @@ if __name__ == "__main__":
         print(line1.value(), line2.value(), line3.value(), line4.value())
         time.sleep(0.1)
         print("Ctrl+C で終了")
+    
